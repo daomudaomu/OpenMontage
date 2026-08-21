@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,11 @@ class PiperTTS(BaseTool):
                 "type": "number",
                 "default": 0.3,
             },
+            "data_dir": {
+                "type": "string",
+                "default": "~/.piper/models",
+                "description": "Directory containing piper .onnx voice models.",
+            },
             "output_path": {"type": "string"},
         },
     }
@@ -95,8 +101,18 @@ class PiperTTS(BaseTool):
     side_effects = ["writes audio file to output_path"]
     user_visible_verification = ["Listen to generated audio for intelligibility"]
 
+    @staticmethod
+    def _piper_cmd() -> str | None:
+        found = shutil.which("piper")
+        if found:
+            return found
+        venv_piper = Path(sys.executable).parent / "piper"
+        if venv_piper.exists():
+            return str(venv_piper)
+        return None
+
     def get_status(self) -> ToolStatus:
-        if shutil.which("piper"):
+        if self._piper_cmd():
             return ToolStatus.AVAILABLE
         return ToolStatus.UNAVAILABLE
 
@@ -120,9 +136,14 @@ class PiperTTS(BaseTool):
         output_path = Path(inputs.get("output_path", "tts_output.wav"))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        piper_cmd = self._piper_cmd()
+        if not piper_cmd:
+            return ToolResult(success=False, error="Piper TTS not available. " + self.install_instructions)
+        data_dir = str(Path(inputs.get("data_dir", str(Path.home() / ".piper" / "models"))).expanduser())
         proc = subprocess.run(
             [
-                "piper",
+                piper_cmd,
+                "--data-dir", data_dir,
                 "--model", inputs.get("model", "en_US-lessac-medium"),
                 "--speaker", str(inputs.get("speaker_id", 0)),
                 "--length-scale", str(inputs.get("length_scale", 1.0)),

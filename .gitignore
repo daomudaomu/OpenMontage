@@ -55,6 +55,9 @@ pexels_video_*.mp4
 # Scratch/debug scripts
 scratch/
 
+# Temporary downloads / source archives (not source code)
+temp/
+
 # Internal docs (strategy, handoffs, playbooks — not shipped)
 internal/
 
