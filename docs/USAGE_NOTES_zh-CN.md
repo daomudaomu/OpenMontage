@@ -184,3 +184,56 @@ python -m pipeline.run --pipeline animated-explainer --project my-demo --topic "
 4. 体验混合路线 C：先用 APIYi 技能生成素材，再走官方工具合成。
 
 5. 把新问题、新结果追加到本文件，再 `git add docs/USAGE_NOTES_zh-CN.md && git commit -m "docs: update usage notes" && git push origin main`。
+
+---
+
+## 7. LDWS 混合路线 C 实战记录（2026-08-23）
+
+### 项目
+
+- 项目目录：`projects/ldws-teaching/`
+- 主题：智能网联汽车 · 车道偏离预警系统（LDWS）教学解说
+- 受众：高职本科智能网联汽车技术专业学生
+- 时长：76 秒，中文配音 + BGM
+- 路线：官方 animated-explainer 立项/脚本/分镜 → 混合 C 素材 → Remotion atelier 动画合成
+
+### 素材与成本
+
+- APIYi GPT Image × 5（教学示意图）
+- APIYi Seedance mini × 8（每章动态视频，480p 5s）
+- Edge TTS 中文旁白 + 字幕
+- Pixabay BGM
+- 总素材成本约 **$1.46**
+
+### 关键经验
+
+1. **用户明确否定了“静态图 + Ken Burns”的模板化做法**：
+   - 初版用 templated Explainer，AI 图整屏 + 缩放，用户反馈“像对着几张图说话”。
+   - 重做为 `composition_mode: "atelier"`，手写 Remotion 动画：车道线扫描、判断流程图、HUD 脉冲、信号链点亮。
+
+2. **字幕要求很具体**：
+   - 位置要贴近底部，不能中间偏下。
+   - 断句要符合中文习惯：按逗号/顿号等自然停顿，不要按字数硬切。
+   - 字幕里不要标点符号，观感更干净。
+   - 最终使用 `narration_sync4.srt`（40 条无标点自然短语）。
+
+3. **Remotion atelier 渲染注意**：
+   - 若入口在 `projects/<slug>/index.tsx`，`video_compose` 会自动 staging 到 `remotion-composer/projects/<slug>/`。
+   - 媒体必须放项目 `public/` 并通过 `staticFile()` 引用，且 `bespoke.public_dir` 指向该目录。
+   - `npx remotion compositions <absolute entry>` 可单独验证入口。
+   - Google Fonts 下载需要代理：`HTTP_PROXY=http://127.0.0.1:7890 HTTPS_PROXY=http://127.0.0.1:7890`。
+
+4. **Sequence 与全局帧的坑**：
+   - 场景组件放在 `<Sequence>` 内时，`useCurrentFrame()` 是相对 Sequence 的帧；若组件内部再用“全局秒数”算 opacity，会导致场景透明/不可见。
+   - 修复：不包 Sequence，直接用全局帧区间控制每个场景显隐。
+
+### 产物
+
+- 推荐播放：`projects/ldws-teaching/renders/ldws_teaching_animated_final.mp4`（720p，字幕已烧录）
+- 1080p 母版：`projects/ldws-teaching/renders/ldws_teaching_animated.mp4`
+- 导出包：`projects/ldws-teaching/export/`
+- 字幕文件：`projects/ldws-teaching/assets/audio/narration_sync4.srt`
+
+### 状态
+
+- 用户已确认 v4 成片，已更新本文档并推送到 `origin main`。
