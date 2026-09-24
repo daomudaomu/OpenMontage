@@ -403,3 +403,172 @@ LDWS 里这个脱钩已具体化为 4 处：字幕路径停在 `narration.srt`�
 - 修复计划：`docs/DEV-PLAN-zh-CN.md`（A 字幕后端根治 → D 记录 → B 可信度 → C APIYi 注册）。
 - 用户决定从 **A + D 起步**；上游文件采用**混合策略**（能绕开就绕开，必须改的加上游补丁标记）。
 - **本次调查全程只读，未修改任何代码**，所有验证脚本写在 `/tmp/` 并已清理。
+
+---
+
+## 9. Phase 1（A 组）实施记录（2026-09-24）
+
+> 计划见 `docs/DEV-PLAN-zh-CN.md` §2。本节记录**实际做了什么、实测数字、以及与原计划的偏差**。
+
+### 9.1 文档失真修正（D3）
+
+| 文档 | 原文 | 实际 |
+|---|---|---|
+| `AGENTS.md`（仓库内） | 只说"读 AGENT_GUIDE.md" | ✅ 正确，无需改 |
+| 工作区 `AGENTS.md`（`AiVideoGeneration/AGENTS.md`，**不在 git 内**） | "本项目使用当前目录下的虚拟环境 `.venv`" | ❌ **不存在**。实际解释器：`/home/fxbchc/CodeSpace/pythonenv/openmontage/bin/python`（3.10.12） |
+| 同上 | "所有 Python 命令必须使用 `.venv/bin/python`" | ❌ 该路径不存在，照抄必失败 |
+| `requirements-dev.txt:5` | `httpx2>=2.0` | ⚠️ 疑似笔误，应为 `httpx`；未擅自改 |
+
+> **注**：那段 `.venv` 说明在**工作区根目录**的 `AGENTS.md`，不在 OpenMontage 仓库里
+> （仓库内的 `AGENTS.md` 只有 9 行，仅指向 `AGENT_GUIDE.md`）。它每次会话以"工作区指令"
+> 形式注入，**照做会直接失败**，故记在此处。因不属于仓库文件，未修改它。
+
+### 9.2 A1 —— `edge_tts.py` 词级时间戳
+
+`tools/audio/edge_tts.py`（173 → 约 380 行）：
+
+- `boundary` 参数默认 `WordBoundary`（原为硬编码走 `Communicate.save()` = `SentenceBoundary`）
+- `save()` → `stream()` **单遍**同时收集音频字节与 boundary 事件
+- 新增可选 `subtitle_path` / `word_tokens_path` / `max_chars_per_cue` / `max_chars_per_line`
+- `dependencies`：`pkg:edge-tts` → `python:edge_tts`
+- `data` 回传 `word_tokens`、`boundary`、`audio_bytes`、`word_token_count`
+
+**实测（同一条文本，voice `zh-CN-XiaoxiaoNeural`）**：
+
+```
+SentenceBoundary →   1 个 boundary 事件
+WordBoundary     →  20 个 boundary 事件（含 offset/duration）
+```
+
+> ⚠️ **顺带解开的旧谜**：`narration_word.srt` 为什么是 0 字节？
+> 因为当时用 **CLI** `edge-tts --write-subtitles`，而 CLI 默认 `WordBoundary`
+> （`Communicate` 默认才是 `SentenceBoundary`）—— 两种模式产出的**字节流不同**。
+> 实测 LDWS 在用的 `narration.mp3` 与 `WordBoundary` 模式**逐字节相同**，
+> 证实它就是 CLI 生成的。这也说明脚本与 CLI 的默认值不一致是个真实陷阱。
+
+**向后兼容实测**：只传 `text` + `output_path` 时，产物仍只有 mp3，`artifacts` 长度 1。
+
+### 9.3 A2 —— 新建 `tools/audio/phrase_aligner.py`
+
+纯标准库（无新依赖）。核心：tokens → 逐字符时间轴 → 短语顺序匹配 → SRT。
+
+**⚠️ 与原计划的重要偏差（计划里的断句算法是错的）**
+
+原计划写的是"标点切子句后**按长度合并**到 ~20 字"。实测这个启发式**会毁掉断句**：
+
+```
+[错] 按长度合并 → '开车时车辆突然向车道线偏移而你却没有察觉'（21字，把3句并成1条）
+[对] 纯标点切分 → '开车时' / '车辆突然向车道线偏移' / '而你却没有察觉'
+```
+
+实测**纯标点切分对人工精调版 40/40 完全命中**结构，仅 1 处差异（拉丁词两侧空格）。
+故最终实现为「**标点优先切分 + 超长强制拆分**」，不做长度打包。`display_text()`
+负责去掉标点并恢复 CJK↔拉丁间距（`是智能网联汽车ADAS中…` → `是智能网联汽车 ADAS 中…`）。
+
+**验收实测（对照入库基准 `examples/ldws-teaching/narration_sync4.srt`）**：
+
+```
+cues 40/40              unmatched 0
+cue 文本完全一致 ✅      line-wrap 完全一致 ✅
+start 偏差: 中位数 +0.050s   |均值| 0.119s   最大 0.539s
+cue 间空隙: 全 0.0（butt-joined）
+首条 0.100s / 末条 76.675s / 音频结束 76.675s
+```
+
+**"不是插值"的证明**（关键验收，已固化为契约测试）：对「cue 起点 ~ 累计字数」
+做最小二乘拟合，取残差标准差：
+
+| 时间轴 | 残差 stdev | 残差 max |
+|---|---|---|
+| `sync4`（人工精调基准） | 401.61 ms | 746.85 ms |
+| **纯字数插值**（构造对照） | **0.00 ms** | **0.00 ms** |
+| `phrase_aligner` 产出 | **504.31 ms** | 1005.16 ms |
+
+纯插值必然落在一条直线上（残差 0）；残差 504ms 即证明时间戳来自音频。
+声学时间与纯插值的**绝对差：中位数 0.436s / 最大 1.174s**。
+
+**折行按显示宽度**：`是智能网联汽车 ADAS 中的一项预警功能` 是 21 字符但仅 36 列宽
+（CJK 计 2），按"20 汉字"预算应留在一行 —— 按字符数算会无故拆行。
+
+### 9.4 A3 —— 时长硬编码修复
+
+**工具侧**（`tools/video/video_compose.py`，对**所有项目**生效）：
+
+新增 `_check_narration_truncation()`，在 `_run_final_review()` 内被调用。从
+`edit_decisions.audio.narration.src` 读旁白真实时长（ffprobe），与成片比较：
+
+```
+改动前输入 76.054s → "Narration truncated: rendered 76.054s but the narration is
+                      77.256s — the last 1.202s of speech is missing."
+正确输入 77.256s   → ok
+更长（尾部音乐）   → ok（只惩罚"短于旁白"，不惩罚更长）
+```
+
+结论写入 `final_review.checks.technical_probe.narration_duration_check`，可审计。
+
+> 原 25% 漂移阈值看不见这个缺陷：76.054 vs 77.256 只有 **1.6%** 漂移。
+
+**项目侧**（`projects/ldws-teaching/index.tsx`）：
+
+- `const DURATION = 76 * FPS` → `calculateMetadata` 用 `getAudioDurationInSeconds()`
+  探测旁白与音乐，取 `max + 0.5s` 尾部；探测失败才回退 `NOMINAL_DURATION`
+- `VideoLayer` / `SceneTitle` 的默认 `end` 改用 `useVideoConfig().durationInFrames`
+- **顺带修掉**：末场 `SignalChainScene` 原 `end = 75 * FPS`，时长修正后会提前 1.7s
+  淡出，收尾句「永远是最终的责任主体」会落在空背景上 → 改为 `durationInFrames`
+
+**真机渲染实测**：
+
+```
+改动前: 76.054s（旁白 77.256s，末 1.202s 丢失）
+改动后: 77.824s  帧数 2333 = ceil((77.256 + 0.5) × 30)
+76.6s 抽帧确认末场信号链五节点仍在画面内
+```
+
+### 9.5 A4 —— 既有测试回归修复（覆盖度是提高，不是降低）
+
+| 用例 | 修法 |
+|---|---|
+| `test_registry_catalog_views` | 原来硬编码 10 个 provider 的**精确集合**（必然随新增 provider 失效）。改为断言"catalog 是完整去重的汇总" + 关键 provider 存在 + 不含 selector |
+| `TestPiperTTS::test_status_requires_piper_executable...` | 失败原因是本地补丁新增了"venv 同级 `piper` 二进制"回退。**没有删断言**，而是把 `sys.executable` 指向无同级二进制的路径；并**新增** `test_status_finds_piper_next_to_running_interpreter` 断言回退本身有效 |
+
+### 9.6 A5 —— 新增回归测试（计划外）
+
+| 文件 | 项数 | 内容 |
+|---|---|---|
+| `tests/contracts/test_subtitle_alignment_contracts.py` | 31 | 依赖前缀一致性、标点处理、断句结构复现、tick/秒双单位、未匹配标记、手工覆盖、butt 连续性、**非插值证明**、注册表发现 |
+| `tests/contracts/test_examples_integrity.py` | 10 | `examples/` 哈希清单 + LDWS SRT 规范性（连续、无标点、文本一致） |
+| `TestNarrationTruncationCheck`（并入 phase3） | 7 | 用真 ffmpeg 生成音频实测时长；覆盖截断/相等/更长/容差/各类跳过 |
+| `tests/fixtures/ldws_tokens.json` | — | 167 个真实 edge-tts token，供离线测试（不联网） |
+
+### 9.7 D5 —— 最终采用的 SRT 纳入受控位置
+
+**问题**：`projects/` 被 gitignore → LDWS 手工精调字幕不可追溯。
+**决策（用户拍定）**：纳入受控位置 → 新建 `examples/<slug>/`，**不放宽 `.gitignore`**
+（`projects/` 下还有数百 MB 生成媒体，放宽会一并入库；`examples/` 是白名单收口）。
+
+```
+examples/ldws-teaching/
+├── narration_sync4.srt   最终采用字幕（40 cue）
+├── narration.txt         对应旁白全文
+├── manifest.json         sha256 + 字节数
+└── README.md             来源 / 为何入库 / 已知缺陷 / 校验方法
+```
+
+**形成约定**：工具可复现的产物留 `projects/`（不入库）；**人工拍定、需长期引用或作回归
+基准**的产物，拷一份到 `examples/<slug>/` 入库，并由 `test_examples_integrity.py` 校验哈希。
+
+### 9.8 测试基线变化
+
+```
+改动前: 843 passed,  2 failed, 7 skipped
+改动后: 894 passed,  0 failed, 7 skipped
+```
+
+### 9.9 本次遗留 / 未做
+
+- **未提交** `projects/ldws-teaching/index.tsx` 的 A3 改动所产出的新成片
+  （A3 验证用的是 `--scale=0.25` 低清测试渲染，写在 `/tmp`，未覆盖交付物）。
+  如需交付新版成片，需按完整参数重渲 + 重新烧字幕（属 Phase 3 的 B2 范围）。
+- `projects/ldws-teaching` 内留了一个备份 `index.tsx.bak-preA3`（该目录不入库）。
+- **仍待办**：Phase 3（B 组：`subtitle_check` 假通过、atelier 不烧字幕、漂移阈值、连带脱钩）
+  与 Phase 4（C 组：APIYi 注册，**须先修 3 项会花钱的缺陷**）。

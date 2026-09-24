@@ -2300,6 +2300,14 @@ class VideoCompose(BaseTool):
                         )
                     technical_probe["target_duration"] = target_dur
                     technical_probe["duration_drift_pct"] = round(drift_pct * 100, 1)
+
+                # Audio-truncation check. The 25% drift budget above is far too
+                # coarse to catch the failure that actually happens: a hardcoded
+                # composition length clipping the tail of the narration. LDWS
+                # rendered 76.054s against a 77.256s mix — 1.2s of speech lost,
+                # only 1.6% drift, so it passed silently. Compare against the
+                # narration itself, not against a target the agent wrote down.
+                self._check_narration_truncation(duration, edit_decisions, technical_probe)
                 if width < 320 or height < 240:
                     technical_probe["issues"].append(
                         f"Resolution {width}x{height} is very low"
@@ -2625,6 +2633,88 @@ class VideoCompose(BaseTool):
         )
 
         return final_review
+
+    @staticmethod
+    def _probe_media_duration(path: Path) -> float | None:
+        """Return a media file's duration in seconds via ffprobe, else None."""
+        try:
+            out = subprocess.check_output(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=nw=1:nk=1",
+                    str(path),
+                ],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=30,
+            )
+            return float(out.strip())
+        except Exception:
+            return None
+
+    def _check_narration_truncation(
+        self,
+        rendered_duration: float,
+        edit_decisions: dict[str, Any] | None,
+        technical_probe: dict[str, Any],
+    ) -> None:
+        """Flag a render that cuts off the tail of its own narration.
+
+        A composition whose length is a hardcoded constant (the atelier
+        `const DURATION = 76 * FPS` pattern) silently clips whatever audio
+        exceeds it. The generic 25% drift check cannot see this: LDWS lost
+        1.2s of speech at 1.6% drift and still reported "pass".
+
+        Reads the narration path from `edit_decisions.audio.narration.src`
+        (the canonical place the edit stage records it) and compares real
+        durations. Adds findings to `technical_probe` in place.
+        """
+        if not edit_decisions:
+            return
+        narration = (edit_decisions.get("audio") or {}).get("narration") or {}
+        src = narration.get("src")
+        if not src:
+            return
+        path = Path(str(src))
+        if not path.is_file():
+            technical_probe["narration_duration_check"] = {
+                "status": "skipped",
+                "reason": f"narration source not found: {path}",
+            }
+            return
+
+        narration_duration = self._probe_media_duration(path)
+        if narration_duration is None:
+            technical_probe["narration_duration_check"] = {
+                "status": "skipped",
+                "reason": "could not probe narration duration (ffprobe failed)",
+            }
+            return
+
+        # A render shorter than its narration is always a defect: the last words
+        # are gone. A render longer than the narration is fine (tail music, an
+        # end card). Tolerance absorbs container/rounding noise only.
+        tolerance = 0.10
+        shortfall = narration_duration - rendered_duration
+        within = shortfall <= tolerance
+
+        technical_probe["narration_duration_check"] = {
+            "status": "ok" if within else "truncated",
+            "narration_seconds": round(narration_duration, 3),
+            "rendered_seconds": round(rendered_duration, 3),
+            "shortfall_seconds": round(shortfall, 3),
+            "narration_path": str(path),
+        }
+
+        if not within:
+            technical_probe["issues"].append(
+                f"Narration truncated: rendered {rendered_duration:.3f}s but the "
+                f"narration is {narration_duration:.3f}s — the last "
+                f"{shortfall:.3f}s of speech is missing. Raise the composition "
+                f"length to at least the audio duration (e.g. derive "
+                f"durationInFrames from the loaded audio rather than a constant)."
+            )
 
     @staticmethod
     def _parse_probe_fps(fps_str: str) -> float:

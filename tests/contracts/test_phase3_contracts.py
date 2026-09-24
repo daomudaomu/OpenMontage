@@ -133,8 +133,28 @@ class TestPiperTTS:
 
         monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "piper" else original_which(cmd))
         monkeypatch.setattr(builtins, "__import__", fake_import)
+        # PiperTTS also accepts a `piper` binary sitting next to the running
+        # interpreter (the venv-sibling fallback). Point sys.executable at a
+        # path with no sibling so this test stays about the F-12 contract
+        # instead of about what happens to be installed on the machine.
+        monkeypatch.setattr(sys, "executable", "/nonexistent-venv/bin/python")
 
         assert PiperTTS().get_status() == ToolStatus.UNAVAILABLE
+
+    def test_status_finds_piper_next_to_running_interpreter(self, monkeypatch, tmp_path):
+        """F-12 follow-up: the tool may fall back to `<sys.executable dir>/piper`.
+
+        This is how Piper is consumed when it is installed as a console script
+        in the project virtualenv but is not on PATH.
+        """
+        fake_bin = tmp_path / "piper"
+        fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake_bin.chmod(0o755)
+
+        monkeypatch.setattr(shutil, "which", lambda cmd: None if cmd == "piper" else shutil.which(cmd))
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "python"))
+
+        assert PiperTTS().get_status() == ToolStatus.AVAILABLE
 
 
 class TestGoogleTTS:
@@ -690,18 +710,15 @@ class TestCapabilityMetadata:
         catalog = reg.capability_catalog()
         assert "tts" in catalog
         providers = {item["provider"] for item in catalog["tts"] if item["provider"] != "selector"}
-        assert providers == {
-            "azure",
-            "dashscope",
-            "doubao",
-            "elevenlabs",
-            "fish_audio",
-            "fal.ai",
-            "google_tts",
-            "kling_official",
-            "openai",
-            "piper",
-        }
+        # `capability_catalog()` calls `ensure_discovered()`, so every tts
+        # provider in the repo is present here — not just the three explicitly
+        # registered above. This asserts the *catalog view* is a complete,
+        # de-duplicated rollup; the per-provider contracts are covered by the
+        # individual TTS test classes.
+        assert providers == set(reg.provider_catalog()) & providers
+        for expected in ("elevenlabs", "openai", "piper", "edge_tts"):
+            assert expected in providers
+        assert "selector" not in providers
 
 
 # ---- Animated Explainer Pipeline ----
@@ -944,3 +961,85 @@ class TestVideoComposeOperations:
         assert not result.success
         assert result.error is not None
         assert "edit_decisions" in result.error
+
+
+class TestNarrationTruncationCheck:
+    """The 25% drift budget cannot see a hardcoded composition length clipping
+    the tail of the narration (LDWS lost 1.2s at 1.6% drift and passed). These
+    lock in the dedicated check that compares against the audio itself."""
+
+    @staticmethod
+    def _probe(rendered: float, edit_decisions: dict) -> dict:
+        from tools.video.video_compose import VideoCompose
+
+        probe: dict = {"issues": []}
+        VideoCompose()._check_narration_truncation(rendered, edit_decisions, probe)
+        return probe
+
+    @staticmethod
+    def _edit_decisions(tmp_path, seconds: float) -> dict:
+        """A real audio file of the given length, so ffprobe is genuinely used."""
+        import subprocess
+
+        audio = tmp_path / "narration.mp3"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+             "-i", f"anullsrc=r=24000:cl=mono", "-t", str(seconds), str(audio)],
+            check=True,
+        )
+        return {"audio": {"narration": {"src": str(audio)}}}
+
+    @staticmethod
+    def _actual_seconds(edit: dict) -> float:
+        """mp3 encoding pads the stream slightly, so measure instead of assuming."""
+        from pathlib import Path
+
+        from tools.video.video_compose import VideoCompose
+
+        return VideoCompose()._probe_media_duration(
+            Path(edit["audio"]["narration"]["src"])
+        )
+
+    def test_detects_truncated_narration(self, tmp_path):
+        edit = self._edit_decisions(tmp_path, 10.0)
+        actual = self._actual_seconds(edit)
+        probe = self._probe(actual - 1.5, edit)
+        assert probe["narration_duration_check"]["status"] == "truncated"
+        assert probe["narration_duration_check"]["shortfall_seconds"] == pytest.approx(
+            1.5, abs=0.01
+        )
+        assert any("truncated" in i.lower() for i in probe["issues"])
+
+    def test_accepts_matching_duration(self, tmp_path):
+        edit = self._edit_decisions(tmp_path, 10.0)
+        probe = self._probe(self._actual_seconds(edit), edit)
+        assert probe["narration_duration_check"]["status"] == "ok"
+        assert probe["issues"] == []
+
+    def test_accepts_longer_render_for_tail_music(self, tmp_path):
+        edit = self._edit_decisions(tmp_path, 10.0)
+        probe = self._probe(self._actual_seconds(edit) + 4.0, edit)
+        assert probe["narration_duration_check"]["status"] == "ok"
+        assert probe["issues"] == []
+
+    def test_tolerates_sub_frame_rounding(self, tmp_path):
+        edit = self._edit_decisions(tmp_path, 10.0)
+        probe = self._probe(self._actual_seconds(edit) - 0.05, edit)
+        assert probe["narration_duration_check"]["status"] == "ok"
+
+    def test_skips_without_edit_decisions(self):
+        probe = self._probe(5.0, None)
+        assert "narration_duration_check" not in probe or (
+            probe["narration_duration_check"].get("status") == "skipped"
+        )
+
+    def test_skips_when_narration_file_missing(self, tmp_path):
+        edit = {"audio": {"narration": {"src": str(tmp_path / "absent.mp3")}}}
+        probe = self._probe(5.0, edit)
+        assert probe["narration_duration_check"]["status"] == "skipped"
+        assert probe["issues"] == []
+
+    def test_skips_when_no_narration_declared(self):
+        probe = self._probe(5.0, {"audio": {"music": {"src": "x.mp3"}}})
+        assert "narration_duration_check" not in probe
+        assert probe["issues"] == []

@@ -1,0 +1,14 @@
+{
+  "example": "ldws-teaching",
+  "description": "Reference subtitles adopted for the LDWS teaching video (animated-explainer / atelier / Remotion).",
+  "files": {
+    "narration.txt": {
+      "sha256": "68aacb12685faa630845f7012265de47a5033e370d6fc674ff604146ff9da477",
+      "bytes": 1013
+    },
+    "narration_sync4.srt": {
+      "sha256": "bdb62d8e2dffcb3f6dc5d66971f904946a6c2aaf9f7e6cba1ebf0d6fb59db0a0",
+      "bytes": 2279
+    }
+  }
+}
