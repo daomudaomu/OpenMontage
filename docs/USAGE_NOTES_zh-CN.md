@@ -237,3 +237,169 @@ python -m pipeline.run --pipeline animated-explainer --project my-demo --topic "
 ### 状态
 
 - 用户已确认 v4 成片，已更新本文档并推送到 `origin main`。
+
+---
+
+## 8. 深度复盘调查（2026-09-24）
+
+对 LDWS 项目做了一次完整复盘，确认 4 组问题、28 项缺陷。**修复计划另见 `docs/DEV-PLAN-zh-CN.md`。**
+本节只记录**证据与结论**（全部为只读调查，未改任何代码）。
+
+### 8.1 环境与文档失真（先记，避免重复踩坑）
+
+| 出处 | 声明 | 现实 |
+|---|---|---|
+| `AGENTS.md` | 用「当前目录下的虚拟环境 `.venv`」 | 🔴 **`.venv` 不存在**；实际是 `/home/fxbchc/CodeSpace/pythonenv/openmontage`（3.10.12） |
+| `AGENTS.md` | mmx 可用 | 配额已耗尽，当前用 Edge TTS 替代 |
+| `.env` | 应有 API Key | **逐字节等于 `.env.example`，全为空** |
+| — | — | 官方 `image_generation` **0/16**、`video_generation` **0/26** 可用；真实凭据只在 `~/.bashrc` |
+| — | — | venv 里**没有 pytest**，`make test` 跑不了；`requirements-dev.txt` 的 `httpx2` 疑似应为 `httpx` |
+| — | — | 合成运行时 ffmpeg / remotion / hyperframes **三者均可用** |
+
+### 8.2 🔴 字幕错位的真正根因（本次最重要发现）
+
+**不是转录对齐失败，而是「按字数线性插值」的估算。**
+
+根因链条：
+
+1. `tools/audio/edge_tts.py`（173 行）**完全不生成字幕** —— 无任何 SRT/SubMaker 代码，只写 mp3。
+   `narration.srt` 是 CLI `--write-subtitles` 的产物。
+2. 该 CLI 的 `boundary` 参数**默认 `SentenceBoundary`** → 中文整句 40 字只有 **1 个 cue（约 9 秒）**。
+3. 于是出现 `narration_word.srt` —— **0 字节空文件**（词级尝试失败）。
+4. `sync` / `sync2` / `sync3` / `sync4` 全部是**手写脚本按「累计字数 ÷ 总字数」线性插值**切句。
+
+**决定性证据**：以原始 14 个句级时间戳为锚点，检验句内是否符合纯字数插值公式：
+
+| 文件 | 条数 | 残差中位数 | 残差最大 |
+|---|---|---|---|
+| `narration_sync.srt` | 47 | **0.65 ms** | 3.78 ms |
+| `narration_sync3.srt` | 40 | **0.55 ms** | 3.78 ms |
+| `narration_sync4.srt` | 40 | 46.21 ms | 233.86 ms |
+
+**亚毫秒残差不可能是巧合** → 时间轴 100% 由字数插值生成，**零声学信息**；sync4 是同一套插值 + 人工按帧微调。
+**这就是为什么返工 4 次都没解决** —— 每次改断句就要重算全部时间戳，而插值永远不等于真实发音时刻，是死循环。
+
+**各版真正在解决的是"粒度"与"断点质量"**（不是漂移）：14 句级 → 47（劈词"车道偏/离预警系统"）→ 62（更碎）→ 40（断点干净）→ 去标点 = sync4。`sync3 → sync4` 的**时间戳集合完全相同**，纯文本去标点。
+
+**修复只需一行参数**。实测 5 个中文音色默认下 `WordBoundary=0`，显式传 `boundary="WordBoundary"` 后：
+
+```
+中文+WordBoundary: WordBoundary 事件数 = 11
+  ('车道', 0.100s) ('偏离', 0.4875s) ('预警', 0.8875s) ('系统', 1.2375s)
+--- SubMaker.get_srt() 条数: 11   ✅ 真正的逐词时间戳
+```
+
+### 8.3 ⚠️ 但 token 切分不可直接当词用
+
+实测 `它不接管方向盘` 被切成 `它/不/接/管方/向盘`（**语义错误**）。
+**已验证的解法**：把 tokens 展开为**逐字符时间轴**（每 token 时长按字符数均分），再用目标短语顺序匹配：
+
+```
+字符流: LDWS车道偏离预警系统是智能网联汽车ADAS中的一项预警功能它不接管方向盘只负责提醒
+'车道偏离预警系统'  → 1.637 ~ 3.188   ✅ 绕开 tokenization 错误
+'它不接管方向盘'    → 7.650 ~ 9.100
+```
+
+### 8.4 🔴 旁白被裁 0.616 秒（独立缺陷）
+
+| 量 | 值 |
+|---|---|
+| `index.tsx:17` 硬编码 | `DURATION = 76 * FPS` = **76.000s** |
+| 旁白真实时长 | **77.256s** |
+| 旁白最后语音结束（silencedetect） | 76.6697s |
+| 成片实际时长 | **76.054s** |
+| → 末尾语音被切 | **0.616s** |
+| → 末条字幕（74.642→77.200）超出成片 | **1.146s**（字幕挂在已无声音的画面上） |
+
+这是观感上"错位"的另一半来源。而 `final_review` 的漂移阈值是 **25%**，1.6% 静默通过。
+
+### 8.5 🔴 审查器会「假通过」（最需警惕）
+
+`tools/video/video_compose.py:2553`：
+
+```python
+if subtitle_check["subtitles_expected"] and not subtitle_check["subtitles_present"]:
+    if sub_source and Path(sub_source).exists():
+        subtitle_check["subtitles_present"] = True   # ← 文件存在就假定已烧录
+        subtitle_check["coverage_ratio"] = 1.0       # ← 覆盖率直接写死
+```
+
+**只要 SRT 文件在磁盘上，无论有没有烧进视频、是不是最新版，都判"字幕已存在、覆盖率 100%"。**
+
+进一步核实：`coverage_ratio` 与 `timing_drift_detected` **全仓无任何计算逻辑**（只在上述一行被赋 `1.0`）
+→ **LDWS 的 `final_review.json` 是手写的**，其"字幕通过、无漂移"不具证据效力。
+
+### 8.6 🔴 atelier 路径根本不烧字幕（已视觉验证）
+
+`_render_via_atelier()` 内 grep 不到任何 `subtitle`/`srt`/`captions`/`burn`。抽帧对照：
+
+| 文件 | 20s 帧 | 结论 |
+|---|---|---|
+| `ldws_teaching_animated_master.mp4`（1080p 母版） | **底部无字幕** | 纯 TSX 渲染产物 |
+| `ldws_teaching_animated_final.mp4`（720p） | **底部有字幕**（无标点，与 sync4 一致） | 二次烧录 |
+
+→ **字幕是渲染后用一次未被记录的 FFmpeg `burn_subtitles` 补上的**，而
+`edit_decisions.subtitles.source` 至今仍指向最粗的 `narration.srt`。
+
+### 8.7 工具层与 registry 机制
+
+- **发现机制**：`pkgutil.walk_packages(tools.__path__)` —— **只递归 `tools/` 这一棵树**。
+  注册条件：`BaseTool` 子类 + `cls.__module__ == 被测模块` + 非抽象 + `name` 非空。
+- **加工具极简**：`tools/<capability>/` 放一个子类文件即可，**不用改清单、不用改 selector**。
+- ⚠️ **`pkg:` 依赖前缀无效**（实测）：`check_dependencies` 只认 `cmd:`/`binary:`/`env:`/`python:`。
+  `edge_tts.py:34` 写的 `pkg:edge-tts` 依赖检查**形同虚设**，只因它自己覆盖了 `get_status()` 才没暴露。
+- `explainer/idea-director.md` 是**死文件**：`animated-explainer.yaml` 里没有 `idea` 阶段
+  （LDWS 也确实直接从 research 起跑）。另有 EP 技能写"墙钟 15 分钟"、清单写 20 分钟的不一致。
+
+### 8.8 中文相关缺陷
+
+- `subtitle_gen` 用 `" ".join` 拼接词 → 中文实测输出 **`车 道 偏 离 预 警`**（已复现）。
+- `remotion_caption_burn._srt_to_word_captions()` 用 `text.split()` → 中文整体失效，需改传词级 `segments`。
+- 官方词级路径在本机**不可用**：`transcriber` 依赖 `python:faster_whisper`，而
+  `faster_whisper` / `whisperx` / `torch` **全部未安装**，且不在任何 requirements 里。
+  `skills/core/subtitle-sync.md` 也完全没提 edge-tts。
+
+### 8.9 APIYi 两个技能（17 项缺陷，2 项会真花钱）
+
+- **为何 registry 发现不到**（三重原因缺一不可）：位置在 `tools/` 包树外 + 是纯 CLI 脚本
+  （无 `BaseTool` 子类）+ 无模块导入。实测 `['apiyi' in n] → []`。
+- 图片走**对话式端点** `/v1/chat/completions`（非 `/v1/images/*`）、无 `size` 参数、**$0.03/张固定**。
+  视频是**提交+轮询**（20s 间隔、1200s 上限），成功状态是 `succeeded`。两脚本 stdout 吐单行 JSON、日志走 stderr。
+
+**两项会真花钱的缺陷：**
+
+| # | 缺陷 | 影响 |
+|---|---|---|
+| **D1** | `generate_video.py:242` 创建任务硬编码 `timeout=60`，**未修复** | 2MB 首帧必超时（已踩过）→ **任务已提交、钱已花** |
+| **D2** | 提交成功后轮询/下载失败**从不取消任务** | 任务孤儿，**白付钱** |
+
+**其他要点**：Node 版 `--duration -1` 直接崩（`ERR_PARSE_ARGS_INVALID_OPTION_VALUE`），官方主推的
+"智能时长"在 Node 版用不了（Python 正常）；Node 的 `AggregateError` 的 `message` 是**空串**
+→ 你记录的"CDN 瞬断"得到代码级解释，**"Python 版更稳定"被证实为真**；
+`.env` 里**没有任何 APIYI 变量**（Key 只在 `~/.bashrc`），而 `BaseTool._load_dotenv()` 只读 `.env`
+→ 注册后不写 `.env` 会恒 UNAVAILABLE；图片脚本**依赖 `requests`**（并非"纯标准库"），视频脚本才是。
+
+### 8.10 系统性判断
+
+> **官方流水线管流程，但真正干活的工具在 registry 之外。**
+> 于是流程产物（`asset_manifest` / `edit_decisions` / `final_review`）与实际交付物**逐渐脱钩**，
+> 而且**没有任何机制会发现这个脱钩** —— 审查器还会主动"假通过"。
+
+LDWS 里这个脱钩已具体化为 4 处：字幕路径停在 `narration.srt`、`final_review` 手写、
+字幕二次烧录未入日志、SRT 不在版本库（`projects/` 被 gitignore，**不可复现**）。
+
+### 8.11 下次稳定产出对齐字幕的推荐做法
+
+1. `boundary="WordBoundary"` + `stream()` 一遍同时产 mp3 与 tokens（**保证 rate 同源**）。
+2. tokens → **逐字符时间轴** → 用目标短语顺序匹配（绕开 tokenization 错误）。
+3. 默认断句从 `script.json` 自动切分，项目内可用短语文件覆盖（保留人工精调能力）。
+4. 视频时长改为 `Math.ceil(audioDuration * FPS)`，并断言 `视频 ≥ 音频`。
+5. 走 atelier 时**必须显式** `video_compose(operation="burn_subtitles", ...)` 并记入 `decision_log`。
+6. **不要相信 `final_review.subtitle_check`**，自己抽帧核对。
+7. 备选（最稳）：装 `faster-whisper`（**无需 API key**，`HF_TOKEN` 仅用于 diarization）走官方转录链路。
+
+### 8.12 本次调查结论
+
+- 修复计划：`docs/DEV-PLAN-zh-CN.md`（A 字幕后端根治 → D 记录 → B 可信度 → C APIYi 注册）。
+- 用户决定从 **A + D 起步**；上游文件采用**混合策略**（能绕开就绕开，必须改的加上游补丁标记）。
+- **本次调查全程只读，未修改任何代码**，所有验证脚本写在 `/tmp/` 并已清理。
