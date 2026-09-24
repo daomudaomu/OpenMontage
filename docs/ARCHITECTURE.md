@@ -387,7 +387,7 @@ All config is validated via Pydantic models in `lib/config_model.py`.
 | `AZURE_SPEECH_KEY` + `AZURE_SPEECH_REGION` | azure_stt, azure_tts | Azure AI Speech cloud transcription + neural TTS (one resource, both directions) |
 | `OPENAI_API_KEY` | openai_tts, openai_image | TTS fallback, GPT Image 2 |
 | `APIYI_API_KEY` | apiyi_image | GPT Image 2 All image gen/edit via api.apiyi.com — flat $0.03/image *(OpenMontage-local patch)* |
-| `APIYI_API_SEEDANCE_KEY` | *(script only)* | Seedance 2.0 video script; token needs the SeeDance2 group enabled *(OpenMontage-local patch)* |
+| `APIYI_API_SEEDANCE_KEY` | apiyi_seedance_video | Seedance 2.0 video via Ark-protocol gateway; token needs the SeeDance2 group enabled *(OpenMontage-local patch)* |
 | `XAI_API_KEY` | grok_image, grok_video | Grok image editing/generation, Grok video generation |
 | `FAL_KEY` | flux_image, kling_video, veo_video, minimax_video, recraft_image | fal.ai hosted models (FLUX, Veo, Kling, MiniMax, Recraft) |
 | `KLING_API_KEY` | kling_official_video, kling_official_image, kling_tts, kling_avatar, kling_lip_sync | Official Kling direct API for video, image, TTS, avatar, and lip sync |

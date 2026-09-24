@@ -59,7 +59,7 @@ Phase 4 完成（全量 tests/）:                 →  1564 passed, 0 failed, 1
 | **B** | `subtitles.style` 字符串 → FFmpeg 烧录**必然崩溃**（计划外发现） | schema 定 `style` 为 string，代码对其调 `.items()` | 🔴 高 | ✅ 已修 |
 | **C** | APIYi 技能未注册进 registry | `'apiyi' in name` → `[]` | 🟡 中 | ✅ `apiyi_image`（C1a） |
 | **C** | 2 条**会真花钱**的缺陷（D1/D2） | 首帧 60s 超时白提交；任务孤儿不取消 | 🔴 高 | ✅ 已修（C0.1/C0.2） |
-| **C** | Seedance 查询路由健康度不可判定（D10） | 10 个历史 ID 全为 32~110 天前，超过 7 天保留期 | 🟡 中 | ⏸ 未决，阻塞 C1b |
+| **C** | Seedance 查询路由健康度不可判定（D10） | 10 个历史 ID 全为 32~110 天前，超过 7 天保留期 | 🟢 低 | ⏸ 未决，**但不再阻塞**（C1b 已解封，见 §5.3）|
 | **D** | hyperframes「可用」系**假阳性**（D11） | `doctor` 以 exit 0 报告 `ok:false`（缺 Chrome），`_probe_cli` 只看退出码 | 🟡 中 | ✅ 已修（§13.7） |
 
 ---
@@ -314,7 +314,7 @@ burn record 送达、`burn_in:false` 跳过、烧录失败即整体 fail）。
 | C0.3 | 上传前校验格式/大小/边长/宽高比，**在 base64 之前**拒绝（**D9**） | ✅ |
 | C0.0 | ~~提交前"路由健康探针"~~ → **已自我否决并取消**：用捏造 ID 探不出路由健康（见下） | ❌ 取消 |
 | C1a | 包装 `ApiyiGptImage2All` → `tools/graphics/apiyi_image.py`（复用脚本逻辑，**不走 subprocess**） | ✅ |
-| C1b | 包装 `ApiyiSeedanceVideo` → **保持阻塞**，理由见 §5.3 | ⏸ 阻塞 |
+| C1b | 包装 `ApiyiSeedanceVideo` → `tools/video/apiyi_seedance_video.py`（子类化 `seedance_ark`，复用 Ark 协议） | ✅ 完成 |
 | C2 | `.env` / `.env.example` 增 `APIYI_*`；`docs/PROVIDERS.md` 登记 | ✅ |
 | C3 | 契约测试 + `estimate_cost`（图片精确 $0.03×n） | ✅ |
 | C4 | 裁定 Node vs Python 版 → **Python**（Node 缺 `-k`、`--duration -1` 崩溃，已实测复现） | ✅ |
@@ -342,22 +342,82 @@ burn record 送达、`burn_in:false` 跳过、烧录失败即整体 fail）。
 
 三个回归测试均通过**变异验证**（改回缺陷版 → 测试必失败；改回 → 文件逐字节相同）。
 
-### 5.3 为何 C1b（Seedance 视频工具）仍阻塞
+### 5.3 C1b 已解封：D10 不再是前置条件
 
 调查初期曾判断"Seedance 查询路由故障"，**该结论已撤回**：`api-details.md` 明写 task_id 仅
 **7 天**内可查，而工作区全部 10 个 `cgt-*` ID 均为 **32~110 天**前，磁盘上**无** 7 天内任务。
-"已过期"是更简约的解释。**定论需要一个新鲜 task_id，即一次真实付费提交**——本轮未申请、未花费；
-其边际成本会在下次真正生成视频时自然为零。
+"已过期"是更简约的解释。
 
-因此 **D10 状态＝未决**。若查询路由确有问题，注册该工具等于交付一个必然失败、且每次提交都
-产生已计费孤儿的工具。C0.1–C0.3 的加固已先行落地，为将来解封做好准备。
+**原计划把 D10 当作 C1b 的硬前置，这个判断本身是错的。** 重新审查后：
 
-### 5.4 测试基线
+- D10 问的是**查询路由**是否健康；C1b 交付的工具主路径是**创建 + 轮询**。
+- 新增实测证据（本次会话）：`GET .../tasks/{捏造id}` 返回 **标准 Ark JSON 401**
+  （`{"error":{"code":"AuthenticationError",...}}`），而**不存在的路径**返回 **SPA HTML 兜底页**。
+  两者响应形态完全不同 → **说明查询路由是存在的**，只是「查不到」被统一映射成 401。
+- 也就是说：D10 无法免费定论这一点仍然成立，但它**不能推出"注册该工具必然失败"**。
+
+因此 C1b 解封，按「先交付可用工具 + 把限制写成显式行为」处理：
+
+| 项 | 处理 |
+|---|---|
+| 查询返回 401 | 与 D10 一致的既有行为；不是本工具引入的缺陷 |
+| 无法取消 | **显式报错**（该网关 `DELETE` 返回 SPA 页；不假装成功）→ 见 C1b 实现 |
+| 提交即扣费 | 沿用 C0.1/C0.2 的加固：创建不重试、ID 落盘 |
+
+**D10 状态仍为未决**，但**不再阻塞任何事**。若将来要关闭它，仍需一次付费提交产生的
+新鲜 task_id（成本会在真正生成视频时自然为零）。
+
+### 5.4 C1b 实现要点（2026-09-24）
+
+**根因（与最初猜测不同）**：不是"APIYi 协议不兼容"。实测发现该网关**就是 Ark 协议的代理**
+（相同 model ID、相同路径形状、相同认证、相同 payload），官方 `seedance_ark` 之所以不能直接指向它，
+**只是缺一个 `Accept-Encoding: identity`** —— 网关的 gzip 头与实际编码不符，标准 `requests`
+会在读出状态码之前就抛解码异常。APIYi 自己的脚本早就用这行 header 绕过了。
+
+**做法**：`tools/video/apiyi_seedance_video.py` **子类化** `SeedanceArkVideo`，只覆盖 6 处：
+
+| 覆盖 | 原因 |
+|---|---|
+| `_get_api_key` | APIYi 的 key 是 `APIYI_API_SEEDANCE_KEY`（与图片 key 分域）|
+| `_get_base_url` | `https://api.apiyi.com/seedance/api/v3`（可 `APIYI_SEEDANCE_BASE_URL` 覆盖）|
+| `_headers` | **加 `Accept-Encoding: identity`** ← 真正的根因 |
+| `estimate_cost_cny` | 该网关**按次**计费，父类的 token 公式会报错价 |
+| `_cost_from_task_cny` | 该网关不返回 token usage，父类会报"未知" → 改用按次价 |
+| `_cancel_task` | **无取消接口** → 明确抛错，而非对 SPA 页判成功 |
+| `_resolve_model` | 该网关**没有 2.5 版本**（实测 `/v1/models` 仅 3 个模型）|
+
+同时给父类加 `PROVIDER_LABEL` 类属性（4 行，带标记），使 10 处用户可见错误串
+不再把 APIYi 调用误称为 "Ark"。
+
+**验证**（`tests/contracts/test_apiyi_seedance_contracts.py`，**37 passed**）：
+
+| 项 | 结果 |
+|---|---|
+| `video_generation` 可用 provider | **从 `0/26` → `apiyi`** ✅（`video_selector` 现可路由）|
+| 真实请求（免费路径）| `GET` 捏造 ID 得到 **HTTP 401 JSON**（而非修前的 gzip 解码崩溃）✅ |
+| payload 与厂商脚本 | **逐字节相同**（比对后删掉父类多余的 `return_last_frame: false`）✅ |
+| 计价 | `mini/480p/5s`=¥1.16、`mini/480p/4s`=¥0.928、`standard/1080p/5s`=¥12.39 ✅ |
+| 变异测试 ×3 | 去掉 header / 改回 token 计价 / cancel 交回父类 → **分别失败 2、12、2 个测试** ✅ |
+
+**发现并修掉的自造缺陷**：初版保留了父类的 `2.5` 变体，会向网关请求一个**不存在**的模型；
+而父类对未知模型报价 `0.0`，于是用户会看到一个"免费"的估计。已改为**本地拒绝**（除非显式传 `model`）。
+另有初版写的一个 1080p 守卫是**死代码**（父类已拦），已删除。
+
+| # | 改动 | 状态 |
+|---|---|---|
+| C1b.1 | 新模块 `tools/video/apiyi_seedance_video.py` | ✅ |
+| C1b.2 | 父类加 `PROVIDER_LABEL`（upstream 追踪文件，带 local-patch 标记）| ✅ |
+| C1b.3 | 契约测试 37 项 + 变异验证 | ✅ |
+| C1b.4 | 文档登记（`PROVIDERS.md` / 创作指南 / 本文件）| ✅ |
+
+### 5.5 测试基线
 
 ```
 Phase 1 后:  1441 passed, 0 failed, 12 skipped
 Phase 3 后:  1492 passed, 0 failed, 12 skipped   (+51)
 Phase 4 后:  1564 passed, 0 failed, 12 skipped   (+72)
+Phase 5 后:  1570 passed, 0 failed, 12 skipped   (+6,  D11 hyperframes)
+C1b  后:  1607 passed, 0 failed, 12 skipped   (+37, apiyi_seedance_video)
 ```
 
 ---
@@ -368,13 +428,14 @@ Phase 4 后:  1564 passed, 0 failed, 12 skipped   (+72)
 Phase 1 (A) ──→ Phase 2 (D1/D3/D4) ──→ Phase 3 (B) ──→ Phase 4 (C)
   字幕根因        记录 + 推送            可信度          注册(需先修 C0)
   ✅ 完成          ✅ 完成               ✅ 完成         ✅ C0–C3(图片) + C4
-                                                         ⏸ C1b 待 D10 定论
+                                                         ✅ C1b 已完成（D10 不再阻塞）
 ```
 
 **AD 起步第一批动作**：D2（本文档 ✅）→ A1/A2 → A3 → D1/D4。**Phase 1~3 均已落地并推送。**
 
 **Phase 4 的硬前置已满足**：C0.1/C0.2/C0.3 三项烧钱缺陷已修完并加测试锁定，图片工具已接进 registry。
-剩余 C1b 待 D10（查询路由健康度）定论，而定论需一次付费提交产生的 7 天内新鲜 task_id。
+**C1b 已于 2026-09-24 完成**（`apiyi_seedance_video`），D10 经复核**不再是前置条件**（见 §5.3）。
+D10 本身仍可留待将来用一次付费提交的新鲜 task_id 关闭，边际成本为零。
 
 ---
 

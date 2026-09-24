@@ -1151,20 +1151,32 @@ Flat per-request billing — cost does not vary with resolution, quality, or pro
 length, so `apiyi_image.estimate_cost()` is exact rather than an estimate. Compare
 against `openai_image`'s `$0.006`–`$0.211` quality-dependent range.
 
-#### Video (Seedance 2.0) — script only, not yet a registered tool
+#### Video (Seedance 2.0) — registered tool + vendor script
 
-Seedance 2.0 video is available through the
-`.agents/skills/apiyi-seedance2-video-gen/scripts/generate_video.py` script. It is
-**not** registered as a `BaseTool` yet, so `video_selector` does not route to it.
+Seedance 2.0 video is available two ways: as the registered tool
+`apiyi_seedance_video` (preferred — `video_selector` routes to it), or through the
+`.agents/skills/apiyi-seedance2-video-gen/scripts/generate_video.py` script.
 
-| Model alias | Full model ID | Max resolution |
-|-------------|---------------|----------------|
-| `standard` | `doubao-seedance-2-0-260128` | 1080p |
-| `fast` | `doubao-seedance-2-0-fast-260128` | 720p |
-| `mini` | `doubao-seedance-2-0-mini-260615` | 720p |
+The tool subclasses `seedance_ark`, because this gateway speaks Ark's protocol:
 
-Reference prices (16:9, 5 s, no input video): `mini` 480p ¥1.16, `mini` 720p ¥2.50,
-`fast` 720p ¥4.00, `standard` 1080p ¥12.39.
+    Ark  : {base}/contents/generations/tasks
+    APIYi: {base}/seedance/api/v3/contents/generations/tasks
+
+with identical auth and body. Three gateway differences are handled inside the
+tool rather than left to the caller: responses carry a gzip `content-encoding`
+that does not match the body (fixed with `Accept-Encoding: identity`, which is
+exactly why the upstream Ark tool cannot be pointed here), billing is flat
+per clip instead of per token, and there is **no cancel route**.
+
+| Model alias | Full model ID | Max resolution | Price (16:9, 5 s, no input video) |
+|-------------|---------------|----------------|----------------------------------|
+| `standard` | `doubao-seedance-2-0-260128` | 1080p | ¥2.31 / ¥4.97 / ¥12.39 |
+| `fast` | `doubao-seedance-2-0-fast-260128` | 720p | ¥1.86 / ¥4.00 |
+| `mini` | `doubao-seedance-2-0-mini-260615` | 720p | ¥1.16 / ¥2.50 |
+
+This gateway does **not** carry the 2.5 variant, so `model_variant="2.5"` is
+refused locally. Prices scale linearly with duration off the 5-second anchor, so
+`mini` + 480p + 4s costs about ¥0.93.
 
 **Billing happens at task creation, not at download.** An accepted create request
 is pre-charged and is *not* refunded if polling, downloading, or the task itself

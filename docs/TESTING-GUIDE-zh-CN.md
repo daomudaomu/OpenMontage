@@ -265,12 +265,12 @@ agent 会按 Rule Zero 走 8 阶段，并在这些点**停下来等你批准**�
 | `music_library` | `local` | 免费 |
 | `subtitle` | 3/3 | 内置 |
 | `video_post` | `ffmpeg` | 内置 |
-| **`video_generation`** | **0/26** | ⚠️ **registry 里没有可用 provider** |
+| **`video_generation`** | ✅ `apiyi_seedance_video` | ¥1.16–12.39/条（**C1b 已于 2026-09-24 完成**）|
 
-> ⚠️ **重要**：`video_generation` 是 **0/26**。Seedance 只能通过
-> `.agents/skills/apiyi-seedance2-video-gen/scripts/generate_video.py` **脚本直调**，
-> 不经过 registry。所以 pipeline 的 `video_selector` 会是 `unavailable`。
-> 要做 AI 动态视频，得显式指定走脚本（这也是 C1b 未完成的原因）。
+> ✅ **已更新（2026-09-24）**：`video_generation` 原有 **0/26**，AI 动态视频只能脚本直调、进不了流水线。
+> 现在 `apiyi_seedance_video` 已注册为一等工具，`video_selector` 能自动发现并路由到它。
+>
+> **三条限制**：提交即扣费（失败不退）；**无法取消任务**（该网关无取消接口）；**没有 2.5 版本**。
 
 ---
 
@@ -279,7 +279,7 @@ agent 会按 Rule Zero 走 8 阶段，并在这些点**停下来等你批准**�
 | 项目 | 单价 |
 |---|---|
 | `apiyi_image`（GPT Image 2）| **$0.03/张** |
-| Seedance `mini` + 480p + 4–5s | 约 **¥1.16** |
+| Seedance `mini` + 480p + 4–5s | 约 **¥0.93–1.16** |
 | Seedance `standard` + 1080p + 5s | 约 **¥12.39** |
 | Edge TTS / Pixabay BGM / ffmpeg / Remotion | **$0** |
 
@@ -317,11 +317,12 @@ agent 会按 Rule Zero 走 8 阶段，并在这些点**停下来等你批准**�
 > | # | 事项 | 怎么做 |
 > |---|---|---|
 > | 1 | **D10 定论** —— Seedance 查询路由是否健康 | 提交成功后**立刻**用那个新鲜 `task_id` 查一次 `GET /seedance/api/v3/contents/generations/tasks/{id}`。任务已付费，这一步天然免费。返回 JSON → 路由正常；仍 401 → 路由确有问题 |
-> | 2 | **C1b 验收** —— Seedance 包装成 BaseTool | 同一次提交就是端到端验收 |
+> | 2 | **C1b 端到端验收** —— `apiyi_seedance_video` 走完真实链路 | 代码已就绪（✅ 2026-09-24）；这一次提交就是首次实盘验证：确认创建、轮询、下载、计费与成本回读都对 |
 >
 > **背景**：工作区现存 10 个 `cgt-*` ID 全部是 32~110 天前，超过网关 **7 天**查询保留期，
 > 而「已过期」与「路由故障」返回**完全一致**（皆 401），因此**无法免费判定**。
 > 详见 `USAGE_NOTES_zh-CN.md` §11.11 / §11.12。
+> **注意**：D10 未决**不再阻塞任何事** —— C1b 已解封并完成（见 `DEV-PLAN-zh-CN.md` §5.3）。
 >
 > **渲染运行时请选 `remotion`**（`ffmpeg` 也稳）；`hyperframes` 本机确实渲染不了。
 

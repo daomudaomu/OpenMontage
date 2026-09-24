@@ -301,7 +301,7 @@ make preflight     # 查看当前能力清单
 | `AGENTS.md` | 用「当前目录下的虚拟环境 `.venv`」 | 🔴 **`.venv` 不存在**；实际是 `/home/fxbchc/CodeSpace/pythonenv/openmontage`（3.10.12） |
 | `AGENTS.md` | mmx 可用 | ⚠️ 早期记为"配额已耗尽"——**该结论已过时**（见 §13.2 更正；实测 `mmx 1.0.22` 可用） |
 | `.env` | 应有 API Key | 2026-09-24 前**逐字节等于 `.env.example`，全为空**；现已填入 APIYi 两把 key（`.env` 被 gitignore） |
-| — | — | 官方 `image_generation` **0/16**、`video_generation` **0/26** 可用；真实凭据只在 `~/.bashrc` |
+| — | — | 官方 `image_generation` **0/16**、`video_generation` **0/26** 可用；真实凭据只在 `~/.bashrc`（**C1b 完成后已变为 `image_generation` 1/17、`video_generation` 1/27**，见 §14）|
 | — | — | ✅ venv 里**已有 pytest**（9.1.1，2026-09-24 装）；`requirements-dev.txt` 的 `httpx2` **不是笔误**（见 §13.2） |
 | — | — | 合成运行时 ffmpeg / remotion **稳定可用**；hyperframes 本机**不可用**（缺 Chrome），D11 修复后已如实上报（见 §13.7） |
 
@@ -1203,3 +1203,96 @@ function buildDoctorReport(outcomes, options = {}) {
 上述探测只证明「不再谎报可用」，**不等于**「该运行时已验证可用」。
 如需启用：`npx hyperframes browser ensure`（下载 152.0.7977.30，**不要中断**——上次中断
 留下的是坏包）。
+
+---
+
+## 14. C1b 完成：Seedance 视频进 registry（2026-09-24）
+
+### 14.1 结论先行
+
+**`video_generation` 从 `0/26` 变为有可用 provider。** 新工具
+`tools/video/apiyi_seedance_video.py` 已注册，`video_selector` 能自动发现并路由。
+**AI 动态视频现在可以走官方流水线**，不再需要脚本直调。
+
+### 14.2 真正的根因（与我此前的说法不同）
+
+我在 §13 前后的对话里说过「AI 生视频做不到 / 和官方用法不一样」，**这个判断是错的**，两次都不准确：
+
+| 我说过的 | 实际 |
+|---|---|
+| ❌「做不到」 | 脚本一直能做；只是没进 registry |
+| ❌「APIYi 与官方不兼容」 | **协议完全相同** —— APIYi 就是 Ark 的代理 |
+| ✅ 真正原因 | 官方 `seedance_ark` 缺一个 `Accept-Encoding: identity` |
+
+实测对比（model ID、路径形状、认证方式、payload 结构**全部一致**）：
+
+```
+Ark  : {base}/contents/generations/tasks
+APIYi: {base}/seedance/api/v3/contents/generations/tasks
+```
+
+**该网关的 gzip 头与实际编码不符。** 标准 `requests` 会在**读出状态码之前**就抛
+`ChunkedEncodingError` / gzip 解码失败。APIYi 自己的脚本早有一行注释绕过它：
+
+```python
+# 网关 gzip 头与实际编码不符，显式声明 identity 规避解码问题
+"Accept-Encoding": "identity",
+```
+
+官方工具没这个 header，所以撞上同一个坑。**这就是全部原因。**
+
+### 14.3 实现
+
+**子类化** `SeedanceArkVideo`（复用 payload/校验/轮询），只覆盖 7 处：
+
+| 覆盖 | 原因 |
+|---|---|
+| `_get_api_key` | 用 `APIYI_API_SEEDANCE_KEY`（与图片 key 分域）|
+| `_get_base_url` | `https://api.apiyi.com/seedance/api/v3` |
+| `_headers` | **加 `Accept-Encoding: identity`** ← 根因 |
+| `estimate_cost_cny` | 该网关**按次**计费，父类 token 公式会报错价 |
+| `_cost_from_task_cny` | 该网关不返回 token usage，父类会报"未知" → 改用按次价 |
+| `_cancel_task` | **无取消接口** → 明确抛错（父类会对 SPA 页判成功）|
+| `_resolve_model` | 该网关**没有 2.5 版本**（实测 `/v1/models` 仅 3 个模型）|
+
+另给父类加 `PROVIDER_LABEL` 类属性（4 行，带 `# OpenMontage-local patch (C1b):` 标记），
+使 10 处用户可见错误串不再把 APIYi 调用误称为 "Ark"。
+
+### 14.4 计费（该网关按次，不是按 token）
+
+16:9 / 5 秒 / 无输入视频：
+
+| 分辨率 | standard | fast | mini |
+|---|---|---|---|
+| 480p | ¥2.31 | ¥1.86 | **¥1.16** |
+| 720p | ¥4.97 | ¥4.00 | ¥2.50 |
+| 1080p | ¥12.39 | 不支持 | 不支持 |
+
+价格随时长**线性缩放**（以 5 秒为锚）：`mini + 480p + 4s` ≈ **¥0.93**。
+
+### 14.5 三条限制（工具已内建处理，但必须知道）
+
+1. **提交即扣费，失败不退** → 先用 `mini + 480p + 4s`（¥0.93）验证 prompt
+2. **无法取消任务** → `cancel` 会**明确报错**，不会假装成功
+3. **没有 2.5 版本** → 本地拒绝，除非显式传 `model`
+
+### 14.6 验证
+
+| 项 | 结果 |
+|---|---|
+| 全量测试 | **1607 passed, 12 skipped**（1570 + 37 新增）|
+| `video_generation` | `0/26` → **`apiyi` 可用** ✅ |
+| 真实请求（免费路径）| `GET` 捏造 ID → **HTTP 401 JSON**（修前是 gzip 解码崩溃）✅ |
+| payload vs 厂商脚本 | **逐字节相同**（比对后删掉父类多余的 `return_last_frame: false`）✅ |
+| 变异测试 ×3 | 去掉 header / 改回 token 计价 / cancel 交回父类 → **分别失败 2、12、2 个测试** ✅ |
+
+**修掉的两个自造缺陷**：
+- 初版保留了父类的 `2.5` 变体 → 会请求网关**不存在**的模型，而父类对未知模型报价 `0.0`，
+  用户会看到"免费"的假估计。已改为本地拒绝。
+- 初版写的一个 1080p 守卫是**死代码**（父类已拦），已删除，换成真正的变体守卫。
+
+### 14.7 仍未做
+
+**未跑真实端到端生成（未花任何钱）。** 上面验证的都是免费路径（本地 payload 构造、
+拿捏造 ID 的 GET）。`apiyi_seedance_video` 的**首次实盘**应在你批准后、用
+`mini + 480p + 4s` 完成，顺带关闭 D10（见 §6.0 提醒）。

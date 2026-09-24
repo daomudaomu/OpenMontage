@@ -44,6 +44,12 @@ class SeedanceArkVideo(BaseTool):
     tier = ToolTier.GENERATE
     capability = "video_generation"
     provider = "ark"
+    # OpenMontage-local patch (C1b): subclasses that reuse this Ark-protocol
+    # implementation against another gateway (see tools/video/apiyi_seedance_video.py)
+    # override this so user-facing errors name the vendor actually called.
+    # Reporting "Ark request failed" for an APIYi call sends the reader to the
+    # wrong dashboard and the wrong API key.
+    PROVIDER_LABEL = "Ark"
     stability = ToolStability.BETA
     execution_mode = ExecutionMode.ASYNC
     determinism = Determinism.STOCHASTIC
@@ -620,7 +626,7 @@ class SeedanceArkVideo(BaseTool):
                     success=False,
                     data={"task_id": task_id, "status": status},
                     error=(
-                        f"Ark Seedance task {status or 'failed'}"
+                        f"{self.PROVIDER_LABEL} Seedance task {status or 'failed'}"
                         + (f": {safe_detail}" if safe_detail else "")
                     ),
                     duration_seconds=round(time.time() - started, 2),
@@ -630,7 +636,9 @@ class SeedanceArkVideo(BaseTool):
             content = task.get("content") or {}
             video_url = content.get("video_url")
             if not video_url:
-                raise RuntimeError("Ark task succeeded without content.video_url")
+                raise RuntimeError(
+                    f"{self.PROVIDER_LABEL} task succeeded without content.video_url"
+                )
             output_path = Path(inputs.get("output_path", "seedance_ark_output.mp4"))
             self._download_video(str(video_url), output_path)
 
@@ -679,7 +687,8 @@ class SeedanceArkVideo(BaseTool):
                 success=False,
                 data=error_data,
                 error=(
-                    f"Ark Seedance request failed: {self._safe_error(exc, api_key)}"
+                    f"{self.PROVIDER_LABEL} Seedance request failed: "
+                    f"{self._safe_error(exc, api_key)}"
                 ),
                 duration_seconds=round(time.time() - started, 2),
             )
@@ -729,8 +738,9 @@ class SeedanceArkVideo(BaseTool):
 
         if inputs.get("reference_video_path"):
             raise ValueError(
-                "reference_video_path is not supported by Ark; upload the "
-                "video to a public/signed HTTPS URL or Ark asset first"
+                f"reference_video_path is not supported by "
+                f"{self.PROVIDER_LABEL}; upload the video to a public/signed "
+                "HTTPS URL or provider asset first"
             )
 
         if operation == "text_to_video":
@@ -1199,7 +1209,7 @@ class SeedanceArkVideo(BaseTool):
             if not value.startswith(("https://", "http://", "asset://")):
                 raise ValueError(
                     f"{label} must be a public/signed URL or asset:// ID; "
-                    "Ark does not document video Base64 or local paths"
+                    f"{self.PROVIDER_LABEL} does not document video Base64 or local paths"
                 )
 
     def _validate_optional_parameters(self, payload: dict[str, Any]) -> None:
@@ -1233,7 +1243,9 @@ class SeedanceArkVideo(BaseTool):
             if url.startswith("data:"):
                 encoded_bytes += len(url.encode("ascii"))
         if encoded_bytes >= self.MAX_REQUEST_BYTES:
-            raise ValueError("Ark request body must be smaller than 64 MB")
+            raise ValueError(
+                f"{self.PROVIDER_LABEL} request body must be smaller than 64 MB"
+            )
 
     @staticmethod
     def _media_counts(content: list[dict[str, Any]]) -> dict[str, int]:
@@ -1288,10 +1300,12 @@ class SeedanceArkVideo(BaseTool):
                     raise
                 time.sleep(self.retry_policy.backoff_seconds * (2**attempt))
         if response is None:
-            raise RuntimeError("Ark query returned no response")
+            raise RuntimeError(f"{self.PROVIDER_LABEL} query returned no response")
         data = response.json()
         if not isinstance(data, dict):
-            raise RuntimeError("Ark query returned a non-object response")
+            raise RuntimeError(
+                f"{self.PROVIDER_LABEL} query returned a non-object response"
+            )
         return data
 
     def _cancel_task(self, task_id: str, api_key: str) -> None:
@@ -1325,11 +1339,11 @@ class SeedanceArkVideo(BaseTool):
                 return task
             if status not in {"queued", "running"}:
                 raise RuntimeError(
-                    f"Ark returned unknown task status: {status or '<empty>'}"
+                    f"{self.PROVIDER_LABEL} returned unknown task status: {status or '<empty>'}"
                 )
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"Ark task {task_id} did not finish within {timeout}s"
+                    f"{self.PROVIDER_LABEL} task {task_id} did not finish within {timeout}s"
                 )
             time.sleep(interval)
 
