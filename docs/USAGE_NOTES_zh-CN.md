@@ -174,6 +174,11 @@ edge-tts --voice zh-CN-XiaoxiaoNeural --text "你好" --write-media out.mp3 --wr
 > 详见 `docs/USAGE_NOTES_zh-CN.md` §11.11 与 §11.12、`docs/DEV-PLAN-zh-CN.md` §5.3。
 > **C1b 在此之前保持阻塞**——若路由确有问题，注册该工具等于交付一个必然失败、且每次提交都产生
 > 已计费孤儿的工具。
+>
+> **另外（渲染运行时选型，2026-09-24 新增）**：本次测试请在提案阶段**选 `remotion`**。
+> `ffmpeg` 与 `remotion` 稳定可用；`hyperframes` 当前是**假阳性**（`render_engines` 可能报 `True`，
+> 但实测缺 Chrome Headless Shell、本地渲染必然失败）。按 HARD RULE 我会照实把两者都报给你，
+> 但请**不要**因它显示 `True` 就选它。详见 §13.7。
 
 ### 6.1 激活环境
 
