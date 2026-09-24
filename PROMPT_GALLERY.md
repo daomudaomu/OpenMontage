@@ -130,7 +130,7 @@ These use the **Animation pipeline** with `image_animation` approach — FLUX-ge
 
 These use the HyperFrames composition runtime — HTML + CSS + GSAP rendered deterministically to video via headless Chrome + FFmpeg. Perfect for kinetic typography, product promos, launch reels, and website-to-video treatments where the visual grammar is typographic and motion-first.
 
-**Requirements:** Node.js ≥ 22, FFmpeg, `npx` — no monorepo checkout, the CLI is fetched via `npx @hyperframes/cli` on first run.
+**Requirements:** Node.js ≥ 22, FFmpeg, `npx` — no monorepo checkout, the CLI is fetched via `npx hyperframes` on first run. (Not `@hyperframes/cli` — that name 404s. Also: on this checkout HyperFrames is currently unavailable because no Chrome Headless Shell is installed; prefer Remotion.)
 
 ### Kinetic Product Launch
 

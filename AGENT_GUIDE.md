@@ -4,6 +4,37 @@ Start here. This is the complete operating guide and agent contract for OpenMont
 
 For architecture, key files, and conventions see [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md).
 
+## Local environment notes (read before your first tool call)
+
+<!-- OpenMontage-local patch: environment facts specific to this checkout. -->
+
+This checkout has been hardened in ways that are **not** upstream behaviour, and four
+local documents capture what a fresh session otherwise rediscovers the hard way:
+
+| Document | Read it when |
+|---|---|
+| [`docs/CREATIVE-WORKFLOW-zh-CN.md`](docs/CREATIVE-WORKFLOW-zh-CN.md) | The user wants a video made. Capability truth, the approval gates, what actually costs money, and phrasings that produce good output. |
+| [`docs/TESTING-GUIDE-zh-CN.md`](docs/TESTING-GUIDE-zh-CN.md) | You need to run or verify tooling. Environment activation, per-tool commands, and known traps. |
+| [`docs/USAGE_NOTES_zh-CN.md`](docs/USAGE_NOTES_zh-CN.md) | Something looks broken or undocumented. Full decision/defect history. |
+| [`docs/DEV-PLAN-zh-CN.md`](docs/DEV-PLAN-zh-CN.md) | You need the status of a known defect (D-numbers) or a phase plan. |
+
+**Four local facts that change what you must do:**
+
+1. **There is no `.venv` in this checkout and no `pipeline/` module.** Do not run
+   `python -m pipeline.run` — it does not exist. You drive `pipeline_defs/*.yaml` yourself.
+   The interpreter is `/home/fxbchc/CodeSpace/pythonenv/openmontage/bin/python`; `make`
+   requires `export VIRTUAL_ENV=/home/fxbchc/CodeSpace/pythonenv/openmontage` first.
+2. **`hyperframes` reports `False` here** (no Chrome Headless Shell) and is not usable.
+   `ffmpeg` and `remotion` are both available; prefer `remotion`. If you present both
+   composition runtimes per the HARD RULE below, state that hyperframes will fail.
+3. **`video_generation` is now available** via `apiyi_seedance_video` (registered
+   2026-09-24). Prefer the tool over the vendor script so assets land in
+   `asset_manifest` and get cost-tracked. It **pre-charges at submit and cannot be
+   cancelled** — never submit without explicit user approval and a stated price.
+4. **`image_generation` is `apiyi` at a flat $0.03/image**; there is no free image
+   provider. A zero-key video therefore means real stock footage or vector/diagram
+   visuals, not AI images.
+
 ## First Interaction — Onboarding
 
 When the user's first message is vague, exploratory, or asks what you can do ("make me a video", "what can you do?", "help me create something", "I want to make content"), read the onboarding skill **before** doing anything else:

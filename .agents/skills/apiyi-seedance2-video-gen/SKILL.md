@@ -38,8 +38,29 @@ description: AI视频生成技能，使用字节跳动 Seedance 2.0 视频生成
 
 ### 第2步：环境检查与命令执行
 
+> ⚠️ **本仓库优先使用注册工具，不是脚本**（2026-09-24 起）
+>
+> OpenMontage **已经把这个能力包装成一等工具** `apiyi_seedance_video`
+> （`tools/video/apiyi_seedance_video.py`），`video_selector` 能自动发现它。
+>
+> **在 OpenMontage 流水线里，请调用工具（走 registry），不要跑下面的脚本。**
+> 跑脚本会导致：产物不进 `asset_manifest`、不触发 cost 记账、`events.jsonl` 无记录
+> （LDWS 项目当年就是这样做的，它的 manifest 里写着一个代码库里不存在的工具名）。
+>
+> 脚本仍然有效，适用于**脱离流水线的单条试片**场景。
+>
+> | 场景 | 用什么 |
+> |---|---|
+> | 流水线内的 asset 阶段 | **`apiyi_seedance_video` 工具**（经 `video_selector`）|
+> | 想快速试一个 prompt / 手工出片 | 下面的 `scripts/generate_video.py` |
+>
+> 工具与脚本的**参数语义一致**，差异只有三点（工具已内建处理）：
+> ① 工具用 `Accept-Encoding: identity` 绕过网关 gzip 头不匹配（脚本同样有）；
+> ② 工具按次计价（与脚本的费用速查表一致）；
+> ③ **该网关无法取消任务** —— 工具的 `task_action="cancel"` 会明确报错。
+
 1. **检查环境**：确认 `APIYI_API_SEEDANCE_KEY` 环境变量已设置（通常假定已设置，运行失败再提示用户）。令牌须勾选 `SeeDance2` 分组且计费模式为「按量优先」，否则报「该模型无可用渠道」。
-2. **构建并运行命令**：
+2. **构建并运行命令**（仅在脱离流水线、手工试片时）：
    - **优先使用 Python 版本**：`scripts/generate_video.py`（仅用标准库，无需 pip install）。
      ⚠️ **本仓库已裁定 Python 为准**（2026-09-24 实测）——原文档"优先 Node、参数与 Python 一致"
      的说法**不成立**，见下方"Node 版本已知缺陷"。

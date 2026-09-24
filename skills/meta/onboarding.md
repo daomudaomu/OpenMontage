@@ -53,9 +53,18 @@ entries in the provider menu. Report each one's availability separately:
   Best for React-based scene components (text cards, stat cards, charts),
   word-level captions, and the `TalkingHead` avatar composition.
 - **HyperFrames** requires Node.js ≥ 22 + `npx` + FFmpeg. Consumed via
-  `npx @hyperframes/cli` (no monorepo checkout required). Best for
+  `npx hyperframes` (no monorepo checkout required). Best for
   HTML/CSS/GSAP motion graphics — kinetic typography, product promos,
   launch reels, website-to-video workflows, registry blocks.
+
+> **Local note (this checkout):** HyperFrames reports unavailable here — there is no
+> Chrome Headless Shell, so `doctor` fails its render-critical check and local rendering
+> is impossible. Present it honestly as unavailable rather than offering it, and prefer
+> Remotion. Enabling it needs `npx hyperframes browser ensure` (do not interrupt the
+> download). See `docs/USAGE_NOTES_zh-CN.md` §13.7.
+>
+> Also note the published npm name is **`hyperframes`**, not `@hyperframes/cli` — the
+> latter 404s. (An older revision of this file said otherwise.)
 
 Name BOTH runtimes explicitly in the "Ready to go" summary when both are
 available — not "Remotion" alone. A fresh-session agent that doesn't

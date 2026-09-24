@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """QA Test 09: HyperFrames end-to-end — scaffold + lint + validate + render.
 
-This test hits the real HyperFrames CLI via `npx @hyperframes/cli`. On first
+This test hits the real HyperFrames CLI via `npx hyperframes` (the published npm
+name; `@hyperframes/cli` is the monorepo-internal name and 404s). On first
 run, npm fetches the package (slow — ~30-90s) and then Chrome downloads its
 browser for validation (~30s extra, cached thereafter). Skip unless
 HYPERFRAMES_QA=1 is set so CI doesn't pay the cost on every run.
