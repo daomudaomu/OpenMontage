@@ -247,7 +247,81 @@ class HyperFramesCompose(BaseTool):
     # We cache per-process so the first call pays ~2-5s and subsequent calls
     # (get_info spam from the registry) are free.
     _npm_resolve_cache: Optional[dict[str, str]] = None
-    _cli_probe_cache: Optional[dict[str, str]] = None
+    # OpenMontage-local patch (D11): values are not all strings any more —
+    # the probe also carries `kind` and `failed_required` (a list).
+    _cli_probe_cache: Optional[dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    # OpenMontage-local patch (D11): decide render readiness from the
+    # per-check results inside `doctor --json`, not the process exit code.
+    #
+    # Verified against hyperframes 0.8.71: the CLI exits 0 even when its own
+    # report says `"ok": false`, so `returncode == 0` proves only that the
+    # CLI bootstrapped — not that it can render. Its top-level `ok` is
+    # `checks.every(o => o.ok)` over ALL checks, so it is NOT usable as a
+    # drop-in substitute either: it goes false when merely-optional tools
+    # (whisper-cpp, Kokoro TTS, MusicGen BGM) are absent, which would report
+    # this runtime permanently unavailable on an otherwise working machine.
+    #
+    # So gate on the subset that genuinely decides a LOCAL render. Docker is
+    # deliberately excluded: `--docker` is opt-in (`args.docker ?? false`)
+    # and local renders drive the host browser directly.
+    # ------------------------------------------------------------------
+    _RENDER_CRITICAL_DOCTOR_CHECKS = ("Chrome", "FFmpeg", "FFprobe")
+    _DOCTOR_PROBE_TIMEOUT_SECONDS = 60
+    _NPM_VIEW_TIMEOUT_SECONDS = 20
+
+    @classmethod
+    def _evaluate_doctor_report(cls, stdout: str) -> dict[str, Any]:
+        """Decide render readiness from raw `hyperframes doctor --json` output.
+
+        Returns one of:
+          {"ok": True,  "failed_required": [], "failed_optional": [...]}
+          {"ok": False, "failed_required": [...], "missing_required": [...]}
+          {"error": "<short>"}
+
+        Never raises.
+        """
+        try:
+            report = json.loads(stdout)
+        except (ValueError, TypeError):
+            return {"error": "doctor --json output was not valid JSON"}
+        if not isinstance(report, dict):
+            return {"error": "doctor --json output was not a JSON object"}
+
+        checks = report.get("checks")
+        if not isinstance(checks, list):
+            return {"error": "doctor --json report has no `checks` list"}
+
+        seen: dict[str, bool] = {}
+        for entry in checks:
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                seen[entry["name"]] = bool(entry.get("ok"))
+
+        failed_required = [
+            name
+            for name in cls._RENDER_CRITICAL_DOCTOR_CHECKS
+            if seen.get(name) is False
+        ]
+        # A critical check we cannot find is not evidence of health. Treat it
+        # as unknown so an upstream schema change cannot quietly restore the
+        # false positive this patch exists to remove.
+        missing_required = [
+            name
+            for name in cls._RENDER_CRITICAL_DOCTOR_CHECKS
+            if name not in seen
+        ]
+        failed_optional = sorted(
+            name
+            for name, ok in seen.items()
+            if not ok and name not in cls._RENDER_CRITICAL_DOCTOR_CHECKS
+        )
+        return {
+            "ok": not failed_required and not missing_required,
+            "failed_required": failed_required,
+            "missing_required": missing_required,
+            "failed_optional": failed_optional,
+        }
 
     @classmethod
     def _node_major_version(cls) -> Optional[int]:
@@ -276,8 +350,13 @@ class HyperFramesCompose(BaseTool):
         on PATH, which meant `runtime_available: True` on any machine with
         Node + FFmpeg — even offline, even if npm was down, even if the
         package was unpublished. This method performs a cheap
-        `npm view hyperframes version` (5s timeout) and caches the answer
+        `npm view hyperframes version` (20s timeout) and caches the answer
         for the rest of the process.
+
+        OpenMontage-local patch (D11): the timeout was 5s, which was observed
+        returning "timeout (5s) — offline or slow registry" on a machine where
+        the same command usually finishes in ~0.3s. A slow-but-healthy registry
+        must not be reported as a broken runtime.
 
         Returns {"version": "X.Y.Z"} on success, {"error": "<short>"} on any
         failure (404, timeout, network error, npm missing). Never raises.
@@ -295,10 +374,15 @@ class HyperFramesCompose(BaseTool):
                 [npm, "view", cls._NPM_PACKAGE, "version"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=cls._NPM_VIEW_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            cls._npm_resolve_cache = {"error": "timeout (5s) — offline or slow registry"}
+            cls._npm_resolve_cache = {
+                "error": (
+                    f"timeout ({cls._NPM_VIEW_TIMEOUT_SECONDS}s) — offline or "
+                    "slow registry"
+                )
+            }
             return cls._npm_resolve_cache
         except (OSError, subprocess.SubprocessError) as e:
             cls._npm_resolve_cache = {"error": f"npm view failed: {type(e).__name__}"}
@@ -324,13 +408,22 @@ class HyperFramesCompose(BaseTool):
         return cls._npm_resolve_cache
 
     @classmethod
-    def _probe_cli(cls) -> dict[str, str]:
+    def _probe_cli(cls) -> dict[str, Any]:
         """Run the published CLI's doctor command once per process.
 
         Package resolution alone does not prove that the executable can start:
         an upstream packaging regression can publish successfully while every
         CLI command crashes during bootstrap. Provider preflight must not call
         that state available.
+
+        OpenMontage-local patch (D11): the exit code alone is NOT sufficient.
+        hyperframes 0.8.71 exits 0 even when `doctor --json` reports
+        `"ok": false` (e.g. no Chrome Headless Shell), so a returncode-only
+        check advertised a runtime that cannot render. Read the per-check
+        results instead — see `_evaluate_doctor_report`.
+
+        A crash-on-bootstrap still shows up: a CLI that cannot start prints no
+        JSON, which `_evaluate_doctor_report` rejects.
         """
         if cls._cli_probe_cache is not None:
             return cls._cli_probe_cache
@@ -345,21 +438,51 @@ class HyperFramesCompose(BaseTool):
                 [npx, "--yes", cls._NPM_PACKAGE, "doctor", "--json"],
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=cls._DOCTOR_PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            cls._cli_probe_cache = {"error": "doctor timed out after 20s"}
+            cls._cli_probe_cache = {
+                "error": (
+                    f"doctor timed out after {cls._DOCTOR_PROBE_TIMEOUT_SECONDS}s"
+                )
+            }
             return cls._cli_probe_cache
         except (OSError, subprocess.SubprocessError) as exc:
             cls._cli_probe_cache = {"error": f"doctor failed: {type(exc).__name__}"}
             return cls._cli_probe_cache
 
-        if proc.returncode != 0:
+        # A non-zero exit with no parseable report stays a hard failure, and
+        # keep the upstream behaviour of surfacing the last line of output.
+        evaluation = cls._evaluate_doctor_report(proc.stdout or "")
+        if evaluation.get("error"):
             output = "\n".join(filter(None, [proc.stderr, proc.stdout])).strip()
             tail = output.splitlines()[-1][:200] if output else f"exit {proc.returncode}"
             cls._cli_probe_cache = {"error": f"doctor failed: {tail}"}
-        else:
-            cls._cli_probe_cache = {"status": "ok"}
+            return cls._cli_probe_cache
+
+        if not evaluation["ok"]:
+            if evaluation["failed_required"]:
+                detail = ", ".join(evaluation["failed_required"])
+                reason = f"doctor reports unmet render requirements: {detail}"
+            else:
+                detail = ", ".join(evaluation["missing_required"])
+                reason = (
+                    "doctor report is missing expected render checks "
+                    f"({detail}) — upstream output format may have changed"
+                )
+            cls._cli_probe_cache = {
+                "error": reason,
+                "kind": "not_render_ready",
+                "failed_required": list(evaluation["failed_required"]),
+                "missing_required": list(evaluation["missing_required"]),
+            }
+            return cls._cli_probe_cache
+
+        cls._cli_probe_cache = {"status": "ok"}
+        if evaluation["failed_optional"]:
+            cls._cli_probe_cache["failed_optional"] = ", ".join(
+                evaluation["failed_optional"]
+            )
         return cls._cli_probe_cache
 
     def _runtime_check(self) -> dict[str, Any]:
@@ -397,11 +520,23 @@ class HyperFramesCompose(BaseTool):
                     f"{npm_resolve['error']}"
                 )
 
-        cli_probe: dict[str, str] = {}
+        cli_probe: dict[str, Any] = {}
         if not reasons:
             cli_probe = self._probe_cli()
             if "error" in cli_probe:
-                reasons.append(f"published CLI is not executable: {cli_probe['error']}")
+                # OpenMontage-local patch (D11): distinguish "the CLI cannot
+                # start" from "the CLI runs but this machine cannot render".
+                # Collapsing both into "not executable" hid the real cause —
+                # a missing Chrome Headless Shell — behind a misleading label.
+                if cli_probe.get("kind") == "not_render_ready":
+                    reasons.append(
+                        f"hyperframes cannot render on this machine: "
+                        f"{cli_probe['error']}"
+                    )
+                else:
+                    reasons.append(
+                        f"published CLI is not executable: {cli_probe['error']}"
+                    )
 
         return {
             "runtime_available": not reasons,
@@ -413,6 +548,16 @@ class HyperFramesCompose(BaseTool):
             "npm_resolve_error": npm_resolve.get("error"),
             "cli_probe_status": cli_probe.get("status"),
             "cli_probe_error": cli_probe.get("error"),
+            # OpenMontage-local patch (D11): surface WHAT the CLI said was
+            # unmet, so preflight can give a precise fix instead of blaming
+            # Node/FFmpeg on a machine where both are already installed.
+            "cli_probe_kind": cli_probe.get("kind"),
+            "cli_probe_failed_required": list(
+                cli_probe.get("failed_required")
+                or cli_probe.get("missing_required")
+                or []
+            ),
+            "cli_probe_failed_optional": cli_probe.get("failed_optional"),
             "reasons": reasons,
         }
 
@@ -425,7 +570,8 @@ class HyperFramesCompose(BaseTool):
         check = self._runtime_check()
         info["hyperframes_runtime"] = check
         if not check["runtime_available"]:
-            info["setup_offer"] = {
+            probe = check.get("cli_probe_failed_required") or []
+            offer: dict[str, Any] = {
                 "effort": (
                     "1-minute fix"
                     if check["npx_available"] and check["ffmpeg_available"]
@@ -437,6 +583,19 @@ class HyperFramesCompose(BaseTool):
                     "product promos, registry blocks, website-to-video."
                 ),
             }
+            # OpenMontage-local patch (D11): when the CLI itself reported which
+            # render requirement is unmet, say so. The generic instructions
+            # blame Node/FFmpeg, which is actively misleading on a machine where
+            # both are installed and only the headless browser is missing.
+            if check.get("cli_probe_kind") == "not_render_ready" and probe:
+                offer["blocked_by"] = list(probe)
+                if "Chrome" in probe:
+                    offer["effort"] = "1-minute fix (download headless browser)"
+                    offer["install_instructions"] = (
+                        "Chrome Headless Shell is required for local rendering. "
+                        "Run: npx hyperframes browser ensure"
+                    )
+            info["setup_offer"] = offer
         return info
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
@@ -508,19 +667,40 @@ class HyperFramesCompose(BaseTool):
 
         # Ask the CLI itself for a deeper check. This also warms the npm
         # cache so the first real render doesn't pay the download cost.
+        #
+        # OpenMontage-local patch (D11): ask for `--json` and judge on the
+        # report's per-check results. With plain `doctor`, a missing Chrome
+        # Headless Shell still exits 0, so `success` was True for an
+        # environment that cannot render.
         try:
-            proc = self._run_hf(["doctor"], cwd=None, timeout=180, check=False)
+            proc = self._run_hf(["doctor", "--json"], cwd=None, timeout=180, check=False)
             out["cli_doctor"] = {
                 "exit_code": proc.returncode,
                 "stdout_tail": (proc.stdout or "")[-4000:],
                 "stderr_tail": (proc.stderr or "")[-4000:],
             }
-            ok = proc.returncode == 0
-            return ToolResult(
-                success=ok,
-                data=out,
-                error=None if ok else f"hyperframes doctor exit {proc.returncode}",
-            )
+            evaluation = self._evaluate_doctor_report(proc.stdout or "")
+            out["cli_doctor"]["evaluation"] = evaluation
+            if evaluation.get("error"):
+                return ToolResult(
+                    success=False,
+                    data=out,
+                    error=(
+                        f"hyperframes doctor could not be interpreted: "
+                        f"{evaluation['error']}"
+                    ),
+                )
+            if not evaluation["ok"]:
+                unmet = evaluation["failed_required"] or evaluation["missing_required"]
+                return ToolResult(
+                    success=False,
+                    data=out,
+                    error=(
+                        "hyperframes doctor reports unmet render requirements: "
+                        + ", ".join(unmet)
+                    ),
+                )
+            return ToolResult(success=True, data=out, error=None)
         except Exception as e:
             out["cli_doctor_error"] = str(e)
             return ToolResult(

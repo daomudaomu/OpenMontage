@@ -175,10 +175,10 @@ edge-tts --voice zh-CN-XiaoxiaoNeural --text "你好" --write-media out.mp3 --wr
 > **C1b 在此之前保持阻塞**——若路由确有问题，注册该工具等于交付一个必然失败、且每次提交都产生
 > 已计费孤儿的工具。
 >
-> **另外（渲染运行时选型，2026-09-24 新增）**：本次测试请在提案阶段**选 `remotion`**。
-> `ffmpeg` 与 `remotion` 稳定可用；`hyperframes` 当前是**假阳性**（`render_engines` 可能报 `True`，
-> 但实测缺 Chrome Headless Shell、本地渲染必然失败）。按 HARD RULE 我会照实把两者都报给你，
-> 但请**不要**因它显示 `True` 就选它。详见 §13.7。
+> **另外（渲染运行时选型，2026-09-24）**：本次测试请在提案阶段**选 `remotion`**。
+> `ffmpeg` 与 `remotion` 稳定可用。`hyperframes` 缺 Chrome Headless Shell，**本机确实渲染不了**；
+> D11 修复后 `render_engines` 已如实报 `False`（修前会谎报 `True`）。详见 §13.7。
+> 若你确实想用 hyperframes，先跑 `npx hyperframes browser ensure`（下载时**不要中断**）。
 
 ### 6.1 激活环境
 
@@ -303,7 +303,7 @@ make preflight     # 查看当前能力清单
 | `.env` | 应有 API Key | 2026-09-24 前**逐字节等于 `.env.example`，全为空**；现已填入 APIYi 两把 key（`.env` 被 gitignore） |
 | — | — | 官方 `image_generation` **0/16**、`video_generation` **0/26** 可用；真实凭据只在 `~/.bashrc` |
 | — | — | ✅ venv 里**已有 pytest**（9.1.1，2026-09-24 装）；`requirements-dev.txt` 的 `httpx2` **不是笔误**（见 §13.2） |
-| — | — | 合成运行时 ffmpeg / remotion **稳定可用**；hyperframes **不可信**（见 §13.7 更正） |
+| — | — | 合成运行时 ffmpeg / remotion **稳定可用**；hyperframes 本机**不可用**（缺 Chrome），D11 修复后已如实上报（见 §13.7） |
 
 ### 8.2 🔴 字幕错位的真正根因（本次最重要发现）
 
@@ -1051,7 +1051,7 @@ pip show openai  →  Requires: anyio, httpx2, jiter, pydantic, sniffio, typing-
 | `remotion-composer/node_modules` | 存在（133 项）→ Remotion 渲染就绪 |
 | `ffmpeg` | 4.4.2 → 就绪 |
 | `node` | v24.19.0（HyperFrames 需 ≥22）→ 就绪 |
-| 三个合成运行时 | ffmpeg / remotion **可用**；hyperframes **不可信**（见 §13.7） |
+| 三个合成运行时 | ffmpeg / remotion **可用**；hyperframes 本机**不可用**（缺 Chrome，D11 已修，见 §13.7） |
 | pytest | 9.1.1 已装 → `make test` 可用 |
 
 ### 13.4 用 `make` 需要先指认真实环境
@@ -1150,13 +1150,56 @@ local tooling exists"* —— **代码与自己声明的契约相反**。后果�
 #### 对本次实拍测试的影响
 
 - **ffmpeg 与 remotion 不受影响，稳定可用** —— 本次测试所需的两个运行时都健康。
-- `hyperframes` 目前**不可承诺可用**。按 HARD RULE 我仍必须在提案阶段如实呈现它，
-  但必须**同时说明它当前会失败**（缺 Chrome Headless Shell），让用户知情选择。
-- **修法（未实施，需批准）预期很小**：`_probe_cli` 解析 `doctor --json` 的 `ok`/必需检查项
-  而不只看退出码；两个超时放宽。因 `hyperframes_compose.py` 是 **upstream 追踪文件**，
-  按既有混合策略需加 `# OpenMontage-local patch:` 标记。
+- `hyperframes` 目前**不可承诺可用**（缺 Chrome Headless Shell），`render_engines` 现已如实报 `False`。
 
-#### 未修原因
+#### ✅ 修复实施（2026-09-24，已批准）
 
-按本会话既定规则：**未经明确批准不改代码**。此项为新增发现（编号 D11），
-与 D10 无关，已记入 `docs/DEV-PLAN-zh-CN.md`。
+用户批准后已修，改动在 `tools/video/hyperframes_compose.py`（**upstream 追踪文件**，
+共 8 处 `# OpenMontage-local patch (D11):` 标记）。
+
+**关键点：不能直接改用 `doctor` 的顶层 `ok`。** 读 CLI 源码（`dist/cli.js`）确认：
+
+```js
+function buildDoctorReport(outcomes, options = {}) {
+  return withMeta({ ok: checks.every((o) => o.ok), ... });   // ← every，含可选项
+}
+```
+
+它是 **所有** 检查项的逻辑与，包含 `whisper-cpp` / `TTS (Kokoro)` / `BGM (MusicGen)` 这些
+**纯可选** 项。本机这三项恰好全缺 → 若直接用 `ok`，就会把「假阳性」翻转成
+**假阴性**（即使装好 Chrome 也永远报不可用）。所以改为**按渲染关键项白名单判定**：
+
+| 判定项 | 说明 |
+|---|---|
+| `Chrome` / `FFmpeg` / `FFprobe` | 决定本机渲染成败的必需项 |
+| `Docker` / `Docker running` | **刻意排除**——`useDocker = args.docker ?? false` 是 opt-in，本地渲染直接驱动宿主浏览器 |
+| 其余（whisper-cpp / Kokoro / MusicGen） | 可选，失败只记入 `failed_optional`，不影响可用性 |
+
+具体改动：
+
+1. 新增 `_evaluate_doctor_report()`：解析 `doctor --json`，返回 `ok` / `failed_required` /
+   `missing_required` / `failed_optional`；**关键项缺失**（上游改了输出格式）也判 `ok=False`，
+   因为这属于「状态未知」，不能当作健康。
+2. `_probe_cli()`：改为 `doctor --json` 并按报告判定，不再只看退出码。CLI 启动即崩（无 JSON）
+   仍判失败——`_evaluate_doctor_report` 会拒绝非 JSON 输出。
+3. 超时放宽：`_probe_cli` **20s → 60s**；`_resolve_npm_package` **5s → 20s**。
+4. `reasons` 区分两种失败：无法启动 → `published CLI is not executable`；
+   能跑但渲染不了 → `hyperframes cannot render on this machine: ...`。
+5. `get_info()['setup_offer']` 新增 `blocked_by`，并据实给出修复指令——
+   原先一律显示「1-minute fix」且暗示装 Node/FFmpeg，而本机这两者都**已装好**，
+   真正缺的是 `npx hyperframes browser ensure`。
+6. `_doctor()` 动作：同样改为 `doctor --json` + 报告判定（原先 `ok = returncode == 0`）。
+
+**验证**（`tests/tools/test_hyperframes_compose.py`，**52 passed**，新增 6 个回归）：
+
+| 验证项 | 结果 |
+|---|---|
+| 本机 `render_engines` | `ffmpeg: True, remotion: True, hyperframes: False` ✅ |
+| `_doctor()` 动作（模拟运行时可用） | `exit_code=0` 但 `evaluation.ok=False` → `success=False` ✅（修前为 `True`） |
+| 变异测试（把退出码逻辑改回旧行为） | 新增 3 个回归测试**立即失败** → 证明测试真能抓住该 bug ✅ |
+| 仅可选项失败 | `runtime_available=True` → 确认未引入假阴性 ✅ |
+
+**仍未做**：真正装上 Chrome Headless Shell 并跑一次真实 hyperframes 渲染。
+上述探测只证明「不再谎报可用」，**不等于**「该运行时已验证可用」。
+如需启用：`npx hyperframes browser ensure`（下载 152.0.7977.30，**不要中断**——上次中断
+留下的是坏包）。

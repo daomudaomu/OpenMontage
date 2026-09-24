@@ -309,6 +309,233 @@ def test_video_compose_render_engines_follow_hyperframes_runtime_check(monkeypat
     )
 
 
+def test_hyperframes_render_readiness_ignores_exit_code(monkeypatch):
+    """Regression (D11): `hyperframes doctor --json` exits 0 while its own
+    report says `"ok": false`. Judging on the exit code therefore advertised
+    a runtime that cannot render — in practice a machine with no Chrome
+    Headless Shell.
+
+    The probe must read the report, and must still treat a bootstrap crash
+    (no parseable JSON) as a failure.
+    """
+    import subprocess as _subprocess
+
+    real_run = _subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if "doctor" not in argv:
+            return real_run(argv, **kwargs)
+        assert "--json" in argv, (
+            "the probe must ask for machine-readable output; plain `doctor` "
+            "exits 0 on failure and cannot be judged"
+        )
+        report = {
+            "ok": False,
+            "checks": [
+                {"name": "Chrome", "ok": False, "detail": "no headless shell"},
+                {"name": "FFmpeg", "ok": True, "detail": "ok"},
+                {"name": "FFprobe", "ok": True, "detail": "ok"},
+                {"name": "whisper-cpp", "ok": False, "detail": "optional"},
+            ],
+        }
+        # Exit code 0 — the whole point of the regression.
+        return _subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(report), stderr=""
+        )
+
+    monkeypatch.setattr(HyperFramesCompose, "_cli_probe_cache", None, raising=False)
+    monkeypatch.setattr(
+        HyperFramesCompose, "_resolve_npm_package",
+        classmethod(lambda cls: {"version": "0.8.71"}),
+    )
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    rc = HyperFramesCompose()._runtime_check()
+    if rc["node_major"] is None or not rc["ffmpeg_available"] or not rc["npx_available"]:
+        pytest.skip("Local runtime floor not met on this machine")
+
+    assert rc["runtime_available"] is False, (
+        "doctor exited 0 but reported a missing render requirement — the "
+        "runtime must NOT be advertised as available."
+    )
+    assert "Chrome" in rc["cli_probe_error"]
+    assert rc["cli_probe_kind"] == "not_render_ready"
+    assert rc["cli_probe_failed_required"] == ["Chrome"]
+
+
+def test_hyperframes_render_readiness_ignores_optional_check_failures(monkeypatch):
+    """The mirror-image trap: `doctor`'s top-level `ok` is
+    `checks.every(o => o.ok)` over ALL checks, so it goes false when merely
+    optional tools (whisper-cpp, Kokoro TTS, MusicGen BGM) are absent.
+
+    Keying availability on that flag would report this runtime permanently
+    unavailable on an otherwise working machine — trading a false positive
+    for a false negative.
+    """
+    import subprocess as _subprocess
+
+    real_run = _subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if "doctor" not in argv:
+            return real_run(argv, **kwargs)
+        report = {
+            "ok": False,  # false ONLY because of optional checks
+            "checks": [
+                {"name": "Chrome", "ok": True, "detail": "ok"},
+                {"name": "FFmpeg", "ok": True, "detail": "ok"},
+                {"name": "FFprobe", "ok": True, "detail": "ok"},
+                {"name": "whisper-cpp", "ok": False, "detail": "optional"},
+                {"name": "TTS (Kokoro)", "ok": False, "detail": "optional"},
+                {"name": "BGM (MusicGen)", "ok": False, "detail": "optional"},
+            ],
+        }
+        return _subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(report), stderr=""
+        )
+
+    monkeypatch.setattr(HyperFramesCompose, "_cli_probe_cache", None, raising=False)
+    monkeypatch.setattr(
+        HyperFramesCompose, "_resolve_npm_package",
+        classmethod(lambda cls: {"version": "0.8.71"}),
+    )
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    rc = HyperFramesCompose()._runtime_check()
+    if rc["node_major"] is None or not rc["ffmpeg_available"] or not rc["npx_available"]:
+        pytest.skip("Local runtime floor not met on this machine")
+
+    assert rc["runtime_available"] is True, (
+        "all render-critical checks passed; missing optional tooling must not "
+        "mark the runtime unavailable."
+    )
+    assert rc["reasons"] == []
+    assert rc["cli_probe_failed_required"] == []
+    assert "whisper-cpp" in (rc["cli_probe_failed_optional"] or "")
+
+
+def test_hyperframes_render_readiness_requires_expected_checks(monkeypatch):
+    """If upstream stops emitting a render-critical check, that is unknown
+    state, not health. Treating it as healthy would silently restore the very
+    false positive this guards against."""
+    import subprocess as _subprocess
+
+    real_run = _subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if "doctor" not in argv:
+            return real_run(argv, **kwargs)
+        # No Chrome entry at all.
+        report = {
+            "ok": True,
+            "checks": [
+                {"name": "FFmpeg", "ok": True, "detail": "ok"},
+                {"name": "FFprobe", "ok": True, "detail": "ok"},
+            ],
+        }
+        return _subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(report), stderr=""
+        )
+
+    monkeypatch.setattr(HyperFramesCompose, "_cli_probe_cache", None, raising=False)
+    monkeypatch.setattr(
+        HyperFramesCompose, "_resolve_npm_package",
+        classmethod(lambda cls: {"version": "0.8.71"}),
+    )
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    rc = HyperFramesCompose()._runtime_check()
+    if rc["node_major"] is None or not rc["ffmpeg_available"] or not rc["npx_available"]:
+        pytest.skip("Local runtime floor not met on this machine")
+
+    assert rc["runtime_available"] is False
+    assert "Chrome" in (rc["cli_probe_failed_required"] or [])
+
+
+def test_hyperframes_probe_rejects_unparseable_output(monkeypatch):
+    """A CLI that crashes during bootstrap prints no JSON. That must remain a
+    failure — the exit-code relaxation must not swallow it."""
+    import subprocess as _subprocess
+
+    real_run = _subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if "doctor" not in argv:
+            return real_run(argv, **kwargs)
+        return _subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr='Error: cannot find module "foo"\n'
+        )
+
+    monkeypatch.setattr(HyperFramesCompose, "_cli_probe_cache", None, raising=False)
+    monkeypatch.setattr(
+        HyperFramesCompose, "_resolve_npm_package",
+        classmethod(lambda cls: {"version": "0.8.71"}),
+    )
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    rc = HyperFramesCompose()._runtime_check()
+    if rc["node_major"] is None or not rc["ffmpeg_available"] or not rc["npx_available"]:
+        pytest.skip("Local runtime floor not met on this machine")
+
+    assert rc["runtime_available"] is False
+    assert rc["cli_probe_error"] is not None
+    assert any("not executable" in r for r in rc["reasons"])
+
+
+def test_hyperframes_evaluate_doctor_report_shapes():
+    """Direct unit coverage for the report evaluator, including malformed
+    input that must never raise."""
+    evaluate = HyperFramesCompose._evaluate_doctor_report
+
+    assert evaluate("not json")["error"]
+    assert evaluate("")["error"]
+    assert evaluate("[]")["error"]
+    assert evaluate('{"no_checks": true}')["error"]
+
+    healthy = evaluate(json.dumps({"checks": [
+        {"name": "Chrome", "ok": True},
+        {"name": "FFmpeg", "ok": True},
+        {"name": "FFprobe", "ok": True},
+    ]}))
+    assert healthy["ok"] is True and healthy["failed_required"] == []
+
+    unhealthy = evaluate(json.dumps({"checks": [
+        {"name": "Chrome", "ok": False},
+        {"name": "FFmpeg", "ok": True},
+        {"name": "FFprobe", "ok": True},
+    ]}))
+    assert unhealthy["ok"] is False
+    assert unhealthy["failed_required"] == ["Chrome"]
+
+
+def test_hyperframes_setup_offer_names_the_real_blocker(monkeypatch):
+    """When the CLI names the unmet requirement, preflight guidance must name
+    it too instead of blaming Node/FFmpeg, which may already be installed."""
+    monkeypatch.setattr(HyperFramesCompose, "_npm_resolve_cache", None, raising=False)
+    monkeypatch.setattr(HyperFramesCompose, "_cli_probe_cache", None, raising=False)
+    monkeypatch.setattr(
+        HyperFramesCompose, "_resolve_npm_package",
+        classmethod(lambda cls: {"version": "0.8.71"}),
+    )
+    monkeypatch.setattr(
+        HyperFramesCompose, "_probe_cli",
+        classmethod(lambda cls: {
+            "error": "doctor reports unmet render requirements: Chrome",
+            "kind": "not_render_ready",
+            "failed_required": ["Chrome"],
+        }),
+    )
+
+    info = HyperFramesCompose().get_info()
+    if info["hyperframes_runtime"]["node_major"] is None:
+        pytest.skip("node not on PATH")
+
+    offer = info["setup_offer"]
+    assert offer["blocked_by"] == ["Chrome"]
+    assert "browser ensure" in offer["install_instructions"]
+    assert "Chrome" in offer["install_instructions"]
+
+
 def test_provider_menu_summary_returns_expected_shape():
     """Regression: AGENT_GUIDE.md line 246 points agents at provider_menu_summary
     for the capability menu. The shape must be stable and cover the four fields
