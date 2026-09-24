@@ -15,17 +15,25 @@
 5. 每阶段结束追加 `docs/USAGE_NOTES_zh-CN.md` 并推 `origin main`。
 
 **环境事实（易踩，先记）**
-- 仓库**没有 `.venv`**（`AGENTS.md` 的说明失真）。用 `/home/fxbchc/CodeSpace/pythonenv/openmontage/bin/python`（3.10.12）。
-- `make test` 依赖 pytest，venv 里**未安装** → 已于 2026-09-24 `pip install pytest`（9.1.1）。`requirements-dev.txt` 里的 `httpx2` 疑似笔误（应为 `httpx`）。
-- 仓库 `.env` 全为空；真实凭据只在 `~/.bashrc`（`APIYI_API_KEY` / `APIYI_API_SEEDANCE_KEY`）。
+- 仓库**没有 `.venv`**（工作区根 `AGENTS.md` 的说明失真）。用 `/home/fxbchc/CodeSpace/pythonenv/openmontage/bin/python`（3.10.12）。
+- `make test` 依赖 pytest —— **已装**（9.1.1，2026-09-24）。
+- ✅ **更正一处我自己的误判**：`requirements-dev.txt:5` 的 `httpx2>=2.0` **不是笔误**。
+  实测它是由 `openai` 引入的**真实 PyPI 包**（pydantic/httpx2，v2.12.0；
+  `pip show openai` → `Requires: anyio, httpx2, jiter, ...`）。**未改动该行**（本来就无需改）。
+  早期笔记里的"疑似笔误"结论**作废**。
+- ✅ **更正一处陈旧结论**：早期记录写 `mmx`（MiniMax）"配额已耗尽" —— **已过时**。实测 `mmx 1.0.22` 可用，
+  `~/.mmx/config.json` 存在（写于 2026-08-21）。是否仍受配额限制需实际调用才知道，**不应再当作既成事实**。
+- 仓库 `.env` 现在**已填入** `APIYI_API_KEY` / `APIYI_API_SEEDANCE_KEY`（2026-09-24，用户授权用于测试）。
+  `.env` 被 `.gitignore` 忽略且从未被跟踪，密钥不会进版本库。
 - `projects/` 与 `music_library/` 被 gitignore → **产物（含 SRT）不在版本库**。
 
-### 测试基线（2026-09-24，装上 pytest 后首测）
+### 测试基线（2026-09-24）
 
 ```
 初始（改动前）:  pytest tests/contracts/ -q  →  843 passed, 2 failed, 7 skipped
 Phase 1 完成:                                →  894 passed, 0 failed, 7 skipped
 Phase 3 完成（全量 tests/）:                 →  1492 passed, 0 failed, 12 skipped
+Phase 4 完成（全量 tests/）:                 →  1564 passed, 0 failed, 12 skipped
 ```
 
 **那 2 个失败是既有回归，非本次改动引入**，且都由 `c52eb0a`（Edge TTS / Piper 本地增强）造成 —— 已在 A4 修复（见下）。

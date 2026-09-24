@@ -294,10 +294,10 @@ make preflight     # 查看当前能力清单
 | 出处 | 声明 | 现实 |
 |---|---|---|
 | `AGENTS.md` | 用「当前目录下的虚拟环境 `.venv`」 | 🔴 **`.venv` 不存在**；实际是 `/home/fxbchc/CodeSpace/pythonenv/openmontage`（3.10.12） |
-| `AGENTS.md` | mmx 可用 | 配额已耗尽，当前用 Edge TTS 替代 |
-| `.env` | 应有 API Key | **逐字节等于 `.env.example`，全为空** |
+| `AGENTS.md` | mmx 可用 | ⚠️ 早期记为"配额已耗尽"——**该结论已过时**（见 §13.2 更正；实测 `mmx 1.0.22` 可用） |
+| `.env` | 应有 API Key | 2026-09-24 前**逐字节等于 `.env.example`，全为空**；现已填入 APIYi 两把 key（`.env` 被 gitignore） |
 | — | — | 官方 `image_generation` **0/16**、`video_generation` **0/26** 可用；真实凭据只在 `~/.bashrc` |
-| — | — | venv 里**没有 pytest**，`make test` 跑不了；`requirements-dev.txt` 的 `httpx2` 疑似应为 `httpx` |
+| — | — | ✅ venv 里**已有 pytest**（9.1.1，2026-09-24 装）；`requirements-dev.txt` 的 `httpx2` **不是笔误**（见 §13.2） |
 | — | — | 合成运行时 ffmpeg / remotion / hyperframes **三者均可用** |
 
 ### 8.2 🔴 字幕错位的真正根因（本次最重要发现）
@@ -461,7 +461,7 @@ LDWS 里这个脱钩已具体化为 4 处：字幕路径停在 `narration.srt`�
 | `AGENTS.md`（仓库内） | 只说"读 AGENT_GUIDE.md" | ✅ 正确，无需改 |
 | 工作区 `AGENTS.md`（`AiVideoGeneration/AGENTS.md`，**不在 git 内**） | "本项目使用当前目录下的虚拟环境 `.venv`" | ❌ **不存在**。实际解释器：`/home/fxbchc/CodeSpace/pythonenv/openmontage/bin/python`（3.10.12） |
 | 同上 | "所有 Python 命令必须使用 `.venv/bin/python`" | ❌ 该路径不存在，照抄必失败 |
-| `requirements-dev.txt:5` | `httpx2>=2.0` | ⚠️ 疑似笔误，应为 `httpx`；未擅自改 |
+| `requirements-dev.txt:5` | `httpx2>=2.0` | ✅ **不是笔误**（我先前的判断错了，见 §13.2）——它是 `openai` 依赖的真实包 |
 
 > **注**：那段 `.venv` 说明在**工作区根目录**的 `AGENTS.md`，不在 OpenMontage 仓库里
 > （仓库内的 `AGENTS.md` 只有 9 行，仅指向 `AGENT_GUIDE.md`）。它每次会话以"工作区指令"
@@ -973,3 +973,103 @@ ID 落盘、回捞入口、上传校验）已先行落地，为将来解封做�
   只覆盖脚本（非 registry 工具，因为 C1b 未做）。
 - **D10 未决**（见 §11.11）——需新鲜 task_id，因此需一次付费提交。
 - 未改动 LDWS 任何产物；未重渲成片。
+
+---
+
+## 13. Phase 5（收尾卫生）实施记录（2026-09-24）
+
+> 本轮为**用户测试前的准备**：修正文档失真、让测试路径真正可用。**未改任何业务流程代码。**
+
+### 13.1 🔴 关键发现：新 shell 里图片工具是 UNAVAILABLE（会直接卡住测试）
+
+用户准备做一次真实的视频测试，但**当时的默认 shell 里 `APIYI_API_KEY` 未导出**：
+
+```
+APIYI_API_KEY          = UNSET
+APIYI_API_SEEDANCE_KEY = UNSET
+→ registry.get('apiyi_image').get_status() == 'unavailable'
+```
+
+**根因**：`BaseTool._load_dotenv()` **只读仓库 `.env`**，不读 `~/.bashrc`；
+而仓库 `.env` 里这两个键只是**空占位**。密钥实际只存在于 `~/.bashrc`，
+于是"注册了工具"≠"工具可用" —— 任何走图片生成的测试都会在**第一步就失败**。
+
+**处理**（经用户授权用于测试）：把两把 key 从 `~/.bashrc` **填入 `.env` 的空占位**。
+
+- **不覆盖**：只在值**为空**时填充；已有真实值一律不动。
+- **不泄露**：全程用脚本写入，日志只打印 `len`，不打印值。
+- **不进库**：`.env` 被 `.gitignore:44`（`*.env`）忽略，且 `git ls-files` 确认**从未被跟踪**。
+
+**验证**（新 shell，显式 unset 两个变量后）：
+
+```
+apiyi_image: available          ✅
+GET https://api.apiyi.com/v1/models -> HTTP 200, 289 models
+  gpt-image-2-all present: True ✅（真实凭据有效，非假可用）
+```
+
+> **教训**：`可用` 有三个层次——**已注册 / 已配置 / 已验活**。
+> 只查 registry 会看到 `available` 或 `unavailable`，但**凭据是否真能用**必须打一次只读端点才知道。
+> 本轮的 `/v1/models` 探测**零花费**。
+
+### 13.2 ✅ 更正我自己的两处错误结论
+
+**（1）`httpx2` 不是笔误 —— 我先前判断错了。**
+
+早期笔记写 `requirements-dev.txt:5` 的 `httpx2>=2.0` "疑似笔误，应为 `httpx`"。
+**实测证明那是错的**：
+
+```
+pip show httpx2  →  Name: httpx2   Version: 2.12.0
+                    Home-page: https://github.com/pydantic/httpx2
+                    Requires: anyio, httpcore2, idna, truststore, typing-extensions
+                    Required-by: openai
+pip show openai  →  Requires: anyio, httpx2, jiter, pydantic, sniffio, typing-extensions
+                    其中 httpx2<3,>=2.7.0
+```
+
+`httpx2` 是 **pydantic 维护的真实 PyPI 包**（httpx 的下一代），由 `openai` SDK 引入。
+**该行无需改动**，已更正 `USAGE_NOTES` §8.1 与本表。
+
+**（2）"mmx 配额已耗尽"是过时结论。**
+
+实测 `mmx 1.0.22` 命令**存在且可执行**，`~/.mmx/config.json` 存在（2026-08-21 写入）。
+是否仍受配额/额度限制**需要实际调用才知道**，不应继续当作既成事实。
+已从"现实"栏改为待验证项。
+
+### 13.3 其余环境事实复核
+
+| 项 | 结论 |
+|---|---|
+| 仓库内 `AGENTS.md` | 9 行，仅指向 `AGENT_GUIDE.md` → ✅ **正确，无需改** |
+| 工作区根 `AGENTS.md` | 仍声称用 `.venv` → ❌ 失真，但**权限 `-r--r--r--` 且不在 git 内**，无法也不应改；已在 §9.1 与本文档标注 |
+| `remotion-composer/node_modules` | 存在（133 项）→ Remotion 渲染就绪 |
+| `ffmpeg` | 4.4.2 → 就绪 |
+| `node` | v24.19.0（HyperFrames 需 ≥22）→ 就绪 |
+| 三个合成运行时 | `ffmpeg / remotion / hyperframes` **全部可用** |
+| pytest | 9.1.1 已装 → `make test` 可用 |
+
+### 13.4 用 `make` 需要先指认真实环境
+
+`Makefile:4` 的 `RUN_PYTHON` 会**优先用 `$VIRTUAL_ENV`**，然后才回落到 `.venv`。
+由于本机没有 `.venv`，直接 `make xxx` 会指向不存在的路径。**正确用法**：
+
+```bash
+export VIRTUAL_ENV=/home/fxbchc/CodeSpace/pythonenv/openmontage
+make preflight      # ✅ 实测可用
+```
+
+**已实测**：`make preflight` 在设置 `VIRTUAL_ENV` 后正常输出完整能力清单。
+
+### 13.5 本轮测试基线
+
+```
+Phase 4 后:  1564 passed, 0 failed, 12 skipped
+Phase 5 后:  1564 passed, 0 failed, 12 skipped   （仅文档 + .env 变更，无回归）
+```
+
+### 13.6 未做
+
+- **未改动任何业务流程代码**（`tools/`、`lib/`、`skills/`、`pipeline_defs/` 均未动）。
+- 未修改工作区根 `AGENTS.md`（只读且不在 git 内）。
+- 未修复"工作区 `AGENTS.md` 的 `.venv` 失真"本身 —— 只能绕过，无法从仓库侧修。
