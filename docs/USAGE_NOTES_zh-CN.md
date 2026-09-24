@@ -160,30 +160,74 @@ edge-tts --voice zh-CN-XiaoxiaoNeural --text "你好" --write-media out.mp3 --wr
 
 ## 6. 下次继续入口
 
-1. 激活环境：
+### 6.0 ⏭️ 待办提醒（用户 2026-09-24 指定）
+
+> **下次真正要生成视频时，顺手用那一次付费提交同时完成两件事，不要为此单独花钱：**
+>
+> | # | 事项 | 怎么做 |
+> |---|---|---|
+> | 1 | **D10 定论**——Seedance 查询路由是否健康 | 提交成功后，**立刻**用那个新鲜 `task_id` 查一次 `GET /seedance/api/v3/contents/generations/tasks/{id}`。这一步天然免费（任务已付费）。返回 JSON → 路由正常，D10 关闭；仍 401 → 路由确有问题 |
+> | 2 | **C1b 验收**——Seedance 包装成 BaseTool | 同一次提交就是端到端验收：确认创建超时、ID 落盘、`--query` 回捞在真实链路上都生效 |
+>
+> **背景**：工作区现存 10 个 `cgt-*` 任务 ID 全部是 32~110 天前，超过该网关 **7 天**的查询保留期；
+> 而"已过期"与"路由故障"返回**完全一致**（皆 401），因此**无法用免费方式判定**。
+> 详见 `docs/USAGE_NOTES_zh-CN.md` §11.11 与 §11.12、`docs/DEV-PLAN-zh-CN.md` §5.3。
+> **C1b 在此之前保持阻塞**——若路由确有问题，注册该工具等于交付一个必然失败、且每次提交都产生
+> 已计费孤儿的工具。
+
+### 6.1 激活环境
 
 ```bash
 source /home/fxbchc/CodeSpace/pythonenv/openmontage/bin/activate
 cd /home/fxbchc/CodeSpace/AiVideoGeneration/OpenMontage
 ```
 
-2. 先确认远程：
+> ⚠️ **工作区根目录的 `AGENTS.md`（不在 git 内）声称本项目用 `.venv`，那是错的** ——
+> 该目录不存在。实际解释器是 `/home/fxbchc/CodeSpace/pythonenv/openmontage/bin/python`（3.10.12）。
+> 系统无 `python` 命令，`/usr/bin/python3` 缺依赖。详见 §9.1。
+
+### 6.2 先确认远程
 
 ```bash
-git remote -v
+git remote -v     # origin = 自己的 fork（可推）；upstream = 只读上游
 ```
 
-3. 体验官方流水线 B，例如：
+### 6.3 查看已有项目与进度
 
 ```bash
-python -m pipeline.run --pipeline animated-explainer --project my-demo --topic "光合作用"
+# 列出项目
+ls projects/
+
+# 看某项目进展到哪个阶段（只读 checkpoint，不修改任何东西）
+python -c "
+from pathlib import Path
+import lib.checkpoint as c
+d, pid = Path('projects'), 'ldws-teaching'
+print('completed:', c.get_completed_stages(d, pid, 'animated-explainer'))
+print('next     :', c.get_next_stage(d, pid, 'animated-explainer'))
+"
+
+# 打开项目看板
+python -m backlot open ldws-teaching
 ```
 
-（具体命令以仓库实际入口为准，先查 `README_zh-CN.md` / `AGENT_GUIDE.md`）
+> ❗**原本文档这里写的 `python -m pipeline.run --pipeline ...` 是错的** ——
+> 仓库**没有** `pipeline/` 这个模块（实测 `ModuleNotFoundError: No module named 'pipeline'`）。
+> OpenMontage 的流程**不是**由一个 Python 编排器驱动的：**是 agent 自己读
+> `pipeline_defs/*.yaml` + `skills/pipelines/**/*-director.md` 来推进**，
+> Python 只提供工具（`tools/`）与状态持久化（`lib/checkpoint.py`）。见 `AGENT_GUIDE.md` 的
+> "Orchestrator" 与 "Rule Zero"。已更正。
 
-4. 体验混合路线 C：先用 APIYi 技能生成素材，再走官方工具合成。
+### 6.4 零密钥体验（不需要任何 API key）
 
-5. 把新问题、新结果追加到本文件，再 `git add docs/USAGE_NOTES_zh-CN.md && git commit -m "docs: update usage notes" && git push origin main`。
+```bash
+make demo          # 用 Remotion 渲染示例视频
+make preflight     # 查看当前能力清单
+```
+
+### 6.5 记录新问题与新结果
+
+把发现追加到本文件，再 `git add docs/USAGE_NOTES_zh-CN.md && git commit -m "docs: update usage notes" && git push origin main`。
 
 ---
 
