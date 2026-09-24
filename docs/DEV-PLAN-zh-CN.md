@@ -24,7 +24,8 @@
 
 ```
 初始（改动前）:  pytest tests/contracts/ -q  →  843 passed, 2 failed, 7 skipped
-当前（Phase 1 完成）:                          →  894 passed, 0 failed, 7 skipped
+Phase 1 完成:                                →  894 passed, 0 failed, 7 skipped
+Phase 3 完成（全量 tests/）:                 →  1492 passed, 0 failed, 12 skipped
 ```
 
 **那 2 个失败是既有回归，非本次改动引入**，且都由 `c52eb0a`（Edge TTS / Piper 本地增强）造成 —— 已在 A4 修复（见下）。
@@ -44,8 +45,10 @@
 |---|---|---|---|---|
 | **A** | 字幕时间戳是「按字数线性插值」的**估算**，非声学对齐 | 残差中位数 **0.55 ms**（零声学信息） | 🔴 高 | ✅ 已修 |
 | **A** | 旁白被裁 1.202s（时长硬编码） | 音频 77.256s vs 成片 76.054s | 🔴 高 | ✅ 已修 |
-| **B** | `subtitle_check` **假通过** | 文件存在即判 `coverage_ratio=1.0`；该字段全仓无计算逻辑 | 🔴 高 | ⬜ Phase 3 |
-| **B** | atelier 路径**不烧字幕** | 抽帧：master 无字幕、final 有字幕 → 未记录的二次烧录 | 🔴 高 | ⬜ Phase 3 |
+| **B** | `subtitle_check` **假通过** | 文件存在即判 `coverage_ratio=1.0`；该字段全仓无计算逻辑 | 🔴 高 | ✅ 已修 |
+| **B** | atelier 路径**不烧字幕** | 抽帧：master 无字幕、final 有字幕 → 未记录的二次烧录 | 🔴 高 | ✅ 已修 |
+| **B** | 时长漂移检查**从未执行**（计划外发现） | 读的 `total_duration_seconds` 非法、`metadata.target_duration_seconds` 无写入方 | 🔴 高 | ✅ 已修 |
+| **B** | `subtitles.style` 字符串 → FFmpeg 烧录**必然崩溃**（计划外发现） | schema 定 `style` 为 string，代码对其调 `.items()` | 🔴 高 | ✅ 已修 |
 | **C** | APIYi 技能未注册进 registry | `'apiyi' in name` → `[]` | 🟡 中 | ⬜ Phase 4 |
 | **C** | 2 条**会真花钱**的缺陷（D1/D2） | 首帧 60s 超时白提交；任务孤儿不取消 | 🔴 高 | ⬜ Phase 4 |
 
@@ -135,6 +138,10 @@ cue 间空隙: 全 0.0（butt-joined，无闪烁无重叠）
 | A3.2 | 渲染前断言 `视频时长 ≥ 音频时长 - 容差` | ✅ 新增 `_check_narration_truncation()` 在 `_run_final_review` 内，对**任意项目**生效 |
 | A3.3 | 断言写进 compose 阶段检查清单 | ✅ 结论写入 `final_review.checks.technical_probe.narration_duration_check` |
 
+> **Phase 3 修正**：A3.2 当时只做到「报告」——该检查把发现写入 `issues`，但 `status` 由关键词
+> 子串匹配决定，`"narration truncated"` 不在词表中，所以截断仍会 `pass`。**拦截能力在 Phase 3
+> 补上**（结构化 `critical_issues`），实测同一场景 `pass → fail`。
+
 **顺带修掉的隐藏缺陷**：末场 `SignalChainScene` 原本 `end = 75 * FPS`，在时长修正后会提前
 1.7s 淡出，导致收尾句「永远是最终的责任主体」落在空背景上 → 已改为 `durationInFrames`。
 
@@ -204,25 +211,84 @@ examples/ldws-teaching/
 
 ---
 
-## 4. Phase 3（B 组）· 校验可信度修复
+## 4. Phase 3（B 组）· 校验可信度修复 —— ✅ 已完成（2026-09-24）
 
 **修复力度（用户 2026-09-24 拍定）**：**零依赖轻量校验先做**；OCR 真核验作为后续独立项。
+**四项决策（用户同日拍板）**：① B2 用「工具内记录式烧录」；② 启用像素可见性探针但**只作告警**；
+③ 校验不通过**判 fail 并拒绝交付**；④ LDWS 历史产物**只追加 decision_log 条目**。
 
-### B1. `subtitle_check` 假通过
-`video_compose.py:2553` —— SRT 文件存在于磁盘即判 `subtitles_present=true` + `coverage_ratio=1.0`。
-`coverage_ratio` / `timing_drift_detected` **全仓无任何计算逻辑**（已 grep 确认）→ LDWS 的 `final_review.json` 系手写，其"字幕通过、无漂移"不具证据效力。
+### 复现证据（改动前实测）
 
-**改法（轻量、零依赖）**：末条字幕是否超出视频时长（捕获 A3 这类问题）；SRT 与输出 mtime 关系；**未提供烧录证据时不再假定通过**。
+| 缺陷 | 复现 | 改动前结果 |
+|---|---|---|
+| B1 | 2 秒视频 + 唯一 cue 在 16:39 的 SRT | `subtitles_present=true, coverage_ratio=1.0, issues=[]`，`status=pass` |
+| B2 | master vs final 底部条带近白像素（7 个时间点） | master 全为 **0.000%**；final 为 **0.983~3.069%** |
+| B3 | 5 秒成片 vs 20 秒旁白 | 检查已记录 `truncated / shortfall=15.064s`，但 `status=pass` |
+| B4 | CJK SRT → `_srt_to_word_captions()` | 40 条 cue → **44 个**伪"词"（整行当一个词，逐词时间系按行等分） |
 
-### B2. atelier 路径不烧字幕
-`_render_via_atelier()` 无任何字幕逻辑；抽帧证实字幕是**未记录的二次 FFmpeg 烧录**。
-→ 让该路径尊重 `edit_decisions.subtitles`，或明确要求显式 `operation="burn_subtitles"` 并记入 `decision_log`。
+### B1. `subtitle_check` 假通过 ✅
+新建 `tools/subtitle/srt_audit.py`（纯标准库，本仓新文件）：真实解析 SRT，产出**计算得出**的
+`coverage_ratio`（cue 并集时长 ÷ 视频时长，**裁剪到视频窗口内**）、真实 `timing_drift_detected`
+（对 `metadata.captions` 做文本定位比对）、越界/乱序检查。
+**关键纠正**：覆盖率必须裁剪——未裁剪时那条 999s 的 cue 会算出 `coverage_ratio=1.0`，
+正是原缺陷的算术根源；裁剪后为 `0.0`。
+**"文件存在即 present" 已删除**：改为要求烧录证据（见 B2），无证据即 **critical**。
 
-### B3. 时长漂移阈值过宽
-当前 25%，使 76.05 vs 77.26（1.6%）静默通过 → 增加"视频时长 < 音频时长"专项检查。
+### B2. atelier 路径烧字幕 ✅
+**原缺陷的实质是顺序错误**：`final_review` 在烧录**之前**运行，结构上不可能看见字幕。
+`_render_via_atelier()` 现在在审查**之前**调用新增的 `_burn_subtitles_with_record()`
+（烧到临时文件再原子替换，避免 ffmpeg 读写同一路径、也避免中断毁掉已渲染的 master），
+并把 `source / source_sha256 / 字节数` 作为 burn record 传给审查器。
+尊重 `edit_decisions.subtitles.burn_in`（新增 schema 字段，默认 `true`）。
+实测：burn 前 ink `0.0%` → burn 后 `3.064%`，record 正确回填，无残留临时文件。
 
-### B4. 连带项
-`asset_manifest.subtitles.path` / `edit_decisions.subtitles.source` 与实际交付物脱钩；`remotion_caption_burn._srt_to_word_captions()` 用 `text.split()` 中文失效。
+### B3. 时长漂移 ✅（根因比计划所写更彻底）
+计划写的是"25% 阈值过宽"，实测发现**该分支从未执行**：
+`total_duration_seconds` 不是合法 `edit_decisions` 字段（`additionalProperties: false`），
+`metadata.target_duration_seconds` 合法但**全仓无任何写入方** —— LDWS 的
+`final_review.json` 里 `duration_drift_pct: None` 即为证据。
+**真正的修复是让致命项结构化**：`_run_final_review` 不再用关键词子串猜 `status`，
+改由各检查登记 `critical_issues`（旁白截断、字幕越界、声明烧录却无证据…），
+`status` 由它派生。`_check_narration_truncation()` 现在**返回**其发现，由调用方升级为 critical。
+实测：同一 5s vs 20s 场景 → `status=fail, action=re_render`。
+
+### B4. 连带项 ✅
+- **声明源 vs 实际烧录源**：比对两者 sha256，不一致判 fail。已实测捕获（声明 `narration.srt` /
+  实烧 `sync4` 正是 LDWS 的真实情形）。
+- **中文切分**：`_srt_to_word_captions()` 检测 CJK 时**不再 `split()`**，每 cue 输出一条、
+  保留真实起止时间（不伪造词时间）；英文仍逐词。实测 40 cue → **40** 条。
+
+### 计划外发现（均已修）
+1. **`_resolve_subtitle_style` 对 schema 合法输入必然崩溃**：schema 定 `subtitles.style` 为
+   **字符串**，代码却调 `.items()` → `AttributeError`。LDWS 自己就写了 `"style": "sentence"`，
+   即任何走 FFmpeg 烧录的路径都会崩。已按 schema 改为读平铺字段（`font`/`font_size`/`color`/
+   `position`…），同时保留对旧嵌套 dict 的兼容。
+2. **A3 的修复此前只做到"报告"**：`_check_narration_truncation` 只写 `issues`，从未影响
+   `status`。现已接入 critical 通道。（修正 Phase 1 中"已修"的表述范围。）
+
+### 上游标记
+`tools/video/video_compose.py`（4 处）、`tools/video/remotion_caption_burn.py`（1 处）、
+`schemas/artifacts/edit_decisions.schema.json`（1 处）均为 upstream 跟踪文件，已加
+`# OpenMontage-local patch:` / description 标记。`tools/subtitle/srt_audit.py` 与测试为本仓新增。
+
+### 新增测试
+`tests/contracts/test_subtitle_verification_contracts.py`（**51 项**）：SRT 解析（含 `,1000`
+畸形时间戳、乱序、非数字序号）、覆盖率裁剪算术、越界/漂移检出、可见性探针、CJK 不分裂、
+以及**门禁行为**（越界 SRT 必须 fail、截断必须 fail、声明≠实烧必须 fail）。
+另含 **atelier 烧录顺序**测试（stub Remotion 渲染，断言 `render → burn → review` 顺序、
+burn record 送达、`burn_in:false` 跳过、烧录失败即整体 fail）。
+`tests/` 全量：**1492 passed, 0 failed, 12 skipped**（Phase 1 基线 1441 passed）。
+
+### LDWS 历史产物
+按 Re-log 约定**只追加** `decision_log` 条目 `d-007`（`category: fallback_decision`，
+`subject: 交付字幕来源`），记录"官方 WhisperX 路径不可用 → 改走 WordBoundary + phrase_aligner、
+实际交付 `narration_sync4.srt`"，未改动既有 6 条、未改动 `edit_decisions` 本身。
+
+### 未做（明确遗留）
+- **未重渲 LDWS 成片**：交付物仍是旧版（76.054s、烧的是 `sync4`）。要出新版需完整重渲。
+- **未做 OCR 真核验**：按决策，像素探针仅告警，不判 fail。
+- 因未重渲，`projects/ldws-teaching/artifacts/final_review.json` **仍是旧的手写产物**；
+  新的审查器在下次渲染时才会重写它。
 
 ---
 
@@ -250,9 +316,12 @@ examples/ldws-teaching/
 ```
 Phase 1 (A) ──→ Phase 2 (D1/D3/D4) ──→ Phase 3 (B) ──→ Phase 4 (C)
   字幕根因        记录 + 推送            可信度          注册(需先修 C0)
+  ✅ 完成          ✅ 完成               ✅ 完成         ⬜ 下一步
 ```
 
-**AD 起步第一批动作**：D2（本文档 ✅）→ A1/A2 → A3 → D1/D4。
+**AD 起步第一批动作**：D2（本文档 ✅）→ A1/A2 → A3 → D1/D4。**Phase 1~3 均已落地并推送。**
+
+**Phase 4 的硬前置未变**：先修 C0.1/C0.2/C0.3 三项会真花钱的缺陷，再把 APIYi 接进 registry。
 
 ---
 
@@ -269,5 +338,11 @@ Phase 1 (A) ──→ Phase 2 (D1/D3/D4) ──→ Phase 3 (B) ──→ Phase 4
 | atelier 不烧字幕 | `_render_via_atelier()` 零字幕代码；master 抽帧无字幕、final 有字幕 |
 | `pkg:` 前缀无效 | 不存在的包不报错；`python:` 前缀正确返回 unavailable |
 | registry 不扫 skills | `walk_packages(tools.__path__)` 仅覆盖 `tools/` 包树 |
+| **漂移检查从未执行** | `total_duration_seconds` 非法（schema `additionalProperties:false`）；`metadata.target_duration_seconds` 全仓无写入方；LDWS `duration_drift_pct: None` |
+| **拦截靠关键词子串** | 旧 `critical_issues` 是对 `issues` 做关键词匹配；`"narration truncated"` 不在词表 → 截断仍 `pass` |
+| **style 字符串必崩** | schema 定 `subtitles.style` 为 string；`_resolve_subtitle_style` 调 `.items()` → `AttributeError` |
+| **B2 烧录实测** | `_burn_subtitles_with_record`：burn 前 ink 0.0% → burn 后 3.064%，record 正确、无残留临时文件 |
+| **中文切分实测** | 40 cue → 修复前 44 个伪词 / 修复后 40 条真实区间；英文仍逐词（`hello brave new world` → 4 词） |
+| **门禁实测** | 越界 SRT：`pass` → `fail`；旁白截断：`pass` → `fail`；声明≠实烧：`fail`（sha256 比对） |
 
-详细过程与命令见 `docs/USAGE_NOTES_zh-CN.md` 第 8 节。
+详细过程与命令见 `docs/USAGE_NOTES_zh-CN.md` 第 8、9 节。

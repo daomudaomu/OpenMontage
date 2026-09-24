@@ -1009,6 +1009,40 @@ class VideoCompose(BaseTool):
             if not mux_result.success:
                 return mux_result
 
+        # --- Subtitle burn-in (BEFORE the review) ---------------------------
+        # OpenMontage-local patch: upstream atelier mode never burns subtitles,
+        # leaving the declared subtitle file unapplied and the final review
+        # blind to it. See docs/DEV-PLAN-zh-CN.md Phase 3 (B2).
+        # The bespoke composition contains no subtitle code: hand-authored
+        # Remotion entries draw their own scenes and nothing else. Subtitles
+        # therefore have to be burned onto the rendered master as a second
+        # FFmpeg pass — which is what run ldws-teaching actually did (the
+        # captioned final carried 1.0-3.1% bottom-band ink; the master 0.0%).
+        # That pass used to happen outside this tool, after the review had
+        # already run, so the review structurally could not see the subtitles
+        # and reported "not present" while the delivered file had them.
+        # Burning here, then reviewing, keeps the audit trail honest.
+        burned_record: dict[str, Any] | None = None
+        ed_subs = (edit_decisions or {}).get("subtitles") or {}
+        if ed_subs.get("enabled") and ed_subs.get("source"):
+            if ed_subs.get("burn_in", True):
+                burn_result = self._burn_subtitles_with_record(
+                    output_path,
+                    ed_subs["source"],
+                    style=self._resolve_subtitle_style(
+                        inputs.get("subtitle_style"), edit_decisions, None
+                    ),
+                )
+                if not burn_result.success:
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"Atelier render succeeded but burning the declared "
+                            f"subtitles failed: {burn_result.error}"
+                        ),
+                    )
+                burned_record = (burn_result.data or {}).get("burn_record")
+
         # --- Atelier post-render review -------------------------------------
         # The cut-schema paths run _run_final_review (technical/visual/audio
         # probes + transcript-vs-script). Atelier MUST do the same so hero
@@ -1023,6 +1057,7 @@ class VideoCompose(BaseTool):
             proposal_packet=inputs.get("proposal_packet"),
             narration_transcript_path=inputs.get("narration_transcript_path"),
             script_text=inputs.get("script_text"),
+            subtitles_burned=burned_record,
         )
 
         atelier_checks = self._run_atelier_checks(entry_path, bespoke)
@@ -1042,6 +1077,7 @@ class VideoCompose(BaseTool):
             "effective_entry": str(effective_entry) if effective_entry != entry_path else None,
             "composition_id": comp_id,
             "output": str(output_path),
+            "subtitles_burned": burned_record,
             "final_review": final_review,
             "final_review_status": final_review.get("status"),
         }
@@ -2220,6 +2256,7 @@ class VideoCompose(BaseTool):
         proposal_packet: dict[str, Any] | None = None,
         narration_transcript_path: str | Path | None = None,
         script_text: str | None = None,
+        subtitles_burned: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run post-render self-review and produce a final_review artifact.
 
@@ -2234,10 +2271,21 @@ class VideoCompose(BaseTool):
         `edit_decisions.metadata.proposal_render_runtime` (which the edit
         director can set explicitly to opt into swap detection).
 
+        `subtitles_burned` is the burn record from a renderer that burns
+        subtitles itself (currently the atelier path, via
+        `_burn_subtitles_with_record`). It carries the real source path,
+        its sha256, and the burn timestamp, which is the only way the
+        subtitle check can distinguish "burned into these pixels" from
+        "an unrelated .srt file happens to sit on disk".
+
         Returns a dict conforming to final_review.schema.json.
         """
         log = logging.getLogger("video_compose.final_review")
         issues: list[str] = []
+        # Structured findings that must flip the overall status. Populated by
+        # the individual checks rather than inferred by substring-matching the
+        # human-readable `issues` list — see the status block at the end.
+        critical_issues: list[str] = []
 
         # --- 1. Technical probe via ffprobe ---
         technical_probe: dict[str, Any] = {
@@ -2284,12 +2332,20 @@ class VideoCompose(BaseTool):
                         f"Output is only {duration:.1f}s — suspiciously short"
                     )
 
-                # Check target duration from edit_decisions
+                # Check target duration from edit_decisions.
+                # `total_duration_seconds` is NOT a legal edit_decisions field
+                # (the schema sets additionalProperties: false), so that read was
+                # always None; `metadata.target_duration_seconds` is legal but no
+                # stage ever writes it. Net effect: this drift branch never ran —
+                # LDWS's final_review.json shows duration_drift_pct: None, which
+                # is why a 25% budget looked harmless. Keep both reads for
+                # callers that do set them, but treat them as optional and let
+                # the narration comparison below be the real reference.
                 target_dur = None
                 if edit_decisions:
                     target_dur = (
-                        edit_decisions.get("total_duration_seconds")
-                        or edit_decisions.get("metadata", {}).get("target_duration_seconds")
+                        edit_decisions.get("metadata", {}).get("target_duration_seconds")
+                        or edit_decisions.get("total_duration_seconds")
                     )
                 if target_dur and target_dur > 0:
                     drift_pct = abs(duration - target_dur) / target_dur
@@ -2299,6 +2355,7 @@ class VideoCompose(BaseTool):
                             f"({drift_pct:.0%} off). Review pacing or trim."
                         )
                     technical_probe["target_duration"] = target_dur
+                    technical_probe["duration_drift_source"] = "edit_decisions"
                     technical_probe["duration_drift_pct"] = round(drift_pct * 100, 1)
 
                 # Audio-truncation check. The 25% drift budget above is far too
@@ -2307,7 +2364,11 @@ class VideoCompose(BaseTool):
                 # rendered 76.054s against a 77.256s mix — 1.2s of speech lost,
                 # only 1.6% drift, so it passed silently. Compare against the
                 # narration itself, not against a target the agent wrote down.
-                self._check_narration_truncation(duration, edit_decisions, technical_probe)
+                truncation = self._check_narration_truncation(
+                    duration, edit_decisions, technical_probe
+                )
+                if truncation:
+                    critical_issues.append(truncation)
                 if width < 320 or height < 240:
                     technical_probe["issues"].append(
                         f"Resolution {width}x{height} is very low"
@@ -2531,6 +2592,13 @@ class VideoCompose(BaseTool):
         issues.extend(promise_preservation.get("issues", []))
 
         # --- 5. Subtitle check ---
+        # OpenMontage-local patch: upstream treated "an .srt exists on disk" as
+        # proof of delivery and hard-coded coverage_ratio = 1.0, which was
+        # computed nowhere — so an unrelated or out-of-range SRT file produced a
+        # clean "subtitles pass" report. The check now measures the SRT itself
+        # (coverage, drift, cues past the end) and requires *burn evidence*
+        # before claiming the subtitles are in the picture.
+        # See docs/DEV-PLAN-zh-CN.md Phase 3 (B1/B4).
         subtitle_check: dict[str, Any] = {
             "subtitles_expected": False,
             "subtitles_present": False,
@@ -2540,7 +2608,8 @@ class VideoCompose(BaseTool):
             ed_subs = edit_decisions.get("subtitles", {})
             subtitle_check["subtitles_expected"] = bool(ed_subs.get("enabled"))
 
-            # Check if output has subtitle stream
+            # --- 5a. Muxed subtitle stream (soft subs) ---
+            sub_streams: list[dict[str, Any]] = []
             if technical_probe.get("valid_container"):
                 try:
                     cmd = [
@@ -2552,27 +2621,132 @@ class VideoCompose(BaseTool):
                         cmd, capture_output=True, text=True, timeout=15
                     )
                     if proc.returncode == 0:
-                        sub_data = json.loads(proc.stdout)
-                        sub_streams = sub_data.get("streams", [])
+                        sub_streams = json.loads(proc.stdout).get("streams", [])
                         subtitle_check["subtitles_present"] = len(sub_streams) > 0
+                        subtitle_check["subtitle_stream_count"] = len(sub_streams)
+                except Exception as e:
+                    subtitle_check["issues"].append(f"Subtitle stream probe error: {e}")
 
-                    # If subtitles were expected but not found as a stream,
-                    # they may be burned in (which is fine — not a failure)
-                    if (subtitle_check["subtitles_expected"]
-                            and not subtitle_check["subtitles_present"]):
-                        # Check if subtitle_path was used (burned in)
-                        sub_source = ed_subs.get("source")
-                        if sub_source and Path(sub_source).exists():
-                            # Burned-in subtitles are not detectable as streams
-                            subtitle_check["subtitles_present"] = True
-                            subtitle_check["coverage_ratio"] = 1.0
+            if subtitle_check["subtitles_expected"]:
+                sub_source = ed_subs.get("source")
+                audit: dict[str, Any] = {}
+                burned_record = dict(subtitles_burned) if subtitles_burned else {}
+
+                # --- 5b. Measure the declared subtitle file ---
+                if not sub_source:
+                    msg = (
+                        "Subtitles are enabled in edit_decisions but no "
+                        "subtitles.source is declared — cannot verify anything."
+                    )
+                    subtitle_check["issues"].append(msg)
+                    critical_issues.append(msg)
+                else:
+                    audit = self._audit_subtitles(
+                        sub_source,
+                        video_duration=duration,
+                        edit_decisions=edit_decisions,
+                        output_path=output_path,
+                    )
+                    subtitle_check.update(audit.get("measurements", {}))
+                    for finding in audit.get("issues", []):
+                        subtitle_check["issues"].append(finding)
+                    # The audit classifies its own findings; escalate the
+                    # critical ones verbatim so the string in `issues`, the
+                    # string in `critical_issues`, and the string in the
+                    # subtitle_check section are all identical. Registering a
+                    # *different* summary text here was a real bug: the
+                    # human-readable finding and the recorded critical finding
+                    # disagreed, so a reader could not tell what blocked.
+                    for finding in audit.get("critical_issues", []):
+                        if finding not in critical_issues:
+                            critical_issues.append(finding)
+                    # The visibility measurement is evidence in every branch
+                    # (including a confirmed burn): it shows whether the pixels
+                    # actually contain caption ink.
+                    if audit.get("visibility"):
+                        subtitle_check["visibility_probe"] = audit["visibility"]
+
+                # --- 5c. Is there evidence the subtitles reached the picture? ---
+                if subtitle_check["subtitles_present"]:
+                    subtitle_check["delivery"] = "soft_subtitle_stream"
+                    subtitle_check["evidence"] = "ffprobe reports a subtitle stream"
+                elif burned_record:
+                    # A renderer burned them and recorded exactly what it burned.
+                    subtitle_check["delivery"] = "burned_in"
+                    subtitle_check["burned"] = burned_record
+                    subtitle_check["subtitles_present"] = True
+                    declared_sha = audit.get("measurements", {}).get("source_sha256")
+                    burned_sha = burned_record.get("source_sha256")
+                    if declared_sha and burned_sha and declared_sha != burned_sha:
+                        msg = (
+                            f"The subtitles burned into the render are NOT the file "
+                            f"declared in edit_decisions.subtitles.source "
+                            f"(declared sha256 {declared_sha[:12]}, burned "
+                            f"{burned_sha[:12]}). The delivered captions do not match "
+                            f"the approved subtitle file."
+                        )
+                        subtitle_check["issues"].append(msg)
+                        critical_issues.append(msg)
+                elif audit.get("measurements"):
+                    # No soft stream and no burn record. Two different
+                    # situations hide here, and conflating them was a bug:
+                    #
+                    #  - `burn_in: false` — the agent explicitly declared that
+                    #    the composition draws its own captions. There will
+                    #    never be a burn record, so the pixel probe is the only
+                    #    evidence available; and per decision it is advisory
+                    #    (bright artwork in the band legitimately reads as ink).
+                    #    Record the measurement and let a human judge.
+                    #  - otherwise — subtitles were supposed to be burned and
+                    #    nothing shows they were. That is a broken deliverable.
+                    probe = audit.get("visibility") or {}
+                    subtitle_check["visibility_probe"] = probe
+                    ratio = probe.get("ratio_max")
+                    composition_drawn = ed_subs.get("burn_in") is False
+
+                    if composition_drawn:
+                        subtitle_check["delivery"] = "composition_drawn"
+                        subtitle_check["evidence"] = (
+                            "burn_in=false — the composition is responsible for "
+                            "captions; only the advisory pixel probe applies"
+                        )
+                        if ratio is not None and ratio > 0:
+                            subtitle_check["issues"].append(
+                                f"Composition-drawn captions: the bottom-band ink "
+                                f"probe measured {ratio:.3%} near-white pixels "
+                                f"(samples: {probe.get('ratios')}), consistent with "
+                                f"captions being drawn."
+                            )
                         else:
                             subtitle_check["issues"].append(
-                                "Subtitles expected but not found in output and "
-                                "no subtitle source file exists for burn-in"
+                                "burn_in=false declares the composition draws its own "
+                                "captions, but the bottom-band ink probe measured "
+                                f"{ratio if ratio is not None else 'no'} near-white "
+                                "pixels. The probe is advisory and cannot prove the "
+                                "captions are missing (bright artwork reads as ink "
+                                "too) — verify this render by eye before shipping it."
                             )
-                except Exception as e:
-                    subtitle_check["issues"].append(f"Subtitle check error: {e}")
+                    else:
+                        if ratio is None:
+                            msg = (
+                                "Subtitles are enabled and a subtitle source exists, "
+                                "but there is no evidence they were burned into the "
+                                "render (no burn record, no subtitle stream). Treat "
+                                "the delivered captions as unverified."
+                            )
+                        else:
+                            msg = (
+                                f"Subtitles are enabled but no burn was recorded; the "
+                                f"bottom-band ink probe measured {ratio:.3%} near-white "
+                                f"pixels (samples: {probe.get('ratios')}). Compare "
+                                f"against an ink-free baseline before trusting this "
+                                f"render."
+                            )
+                        subtitle_check["issues"].append(msg)
+                        # Record the SAME string that appears in
+                        # issues/critical_issues so the report never contradicts
+                        # itself.
+                        critical_issues.append(msg)
 
         issues.extend(subtitle_check.get("issues", []))
 
@@ -2588,7 +2762,14 @@ class VideoCompose(BaseTool):
         issues.extend(transcript_comparison.get("issues", []))
 
         # --- 7. Determine overall status ---
-        critical_issues = [
+        # OpenMontage-local patch: upstream derived critical issues by
+        # substring-matching a hardcoded keyword list against the findings, so a
+        # reported narration truncation ("Narration truncated: ...") still
+        # produced status="pass" — the phrase was not in the list. Checks that
+        # must block now register themselves in `critical_issues` above; the
+        # keyword list is kept only for the findings that never migrated.
+        # See docs/DEV-PLAN-zh-CN.md Phase 3 (B3).
+        keyword_critical = [
             i for i in issues
             if any(kw in i.lower() for kw in [
                 "silent downgrade", "delivery promise violation",
@@ -2596,9 +2777,22 @@ class VideoCompose(BaseTool):
                 "tts punctuation leak",  # reading literal punctuation aloud
             ])
         ]
+        for finding in keyword_critical:
+            if finding not in critical_issues:
+                critical_issues.append(finding)
 
-        if critical_issues:
-            status = "revise"
+        # An invalid container is a hard failure, not a revision request.
+        container_invalid = not technical_probe.get("valid_container")
+
+        if container_invalid:
+            status = "fail"
+            recommended_action = "re_render"
+        elif critical_issues:
+            # A broken deliverable (truncated narration, uncaptioned render,
+            # subtitles that do not belong to this cut) must not ship. Per the
+            # compose contract, fail the ToolResult so the pipeline cannot
+            # present it as complete.
+            status = "fail"
             recommended_action = "re_render"
         elif issues:
             status = "pass"
@@ -2606,10 +2800,6 @@ class VideoCompose(BaseTool):
         else:
             status = "pass"
             recommended_action = "present_to_user"
-
-        if not technical_probe.get("valid_container"):
-            status = "fail"
-            recommended_action = "re_render"
 
         final_review = {
             "version": "1.0",
@@ -2625,6 +2815,11 @@ class VideoCompose(BaseTool):
             },
             "issues_found": issues,
             "recommended_action": recommended_action,
+            "metadata": {
+                # Recorded so a reviewer can tell a blocking finding from an
+                # advisory one without re-deriving the keyword rules.
+                "critical_issues": critical_issues,
+            },
         }
 
         log.info(
@@ -2633,6 +2828,168 @@ class VideoCompose(BaseTool):
         )
 
         return final_review
+
+    def _audit_subtitles(
+        self,
+        sub_source: str,
+        *,
+        video_duration: float | None,
+        edit_decisions: dict[str, Any] | None,
+        output_path: Path,
+        probe_visibility: bool = True,
+    ) -> dict[str, Any]:
+        """Measure a declared subtitle file and report real findings.
+
+        OpenMontage-local addition (not in upstream).
+
+        Zero-dependency: parses the SRT with `tools.subtitle.srt_audit` and
+        compares it to what the render actually is. This replaces the old
+        "the file exists, so coverage is 1.0" assumption.
+
+        The visibility probe is intentionally advisory — it samples the
+        bottom band for near-white ink, which burned captions produce (LDWS
+        measured 1.0-3.1% on the captioned master versus 0.0% on the
+        uncaptioned one). Bright artwork in the band can read as ink, so a
+        low reading is recorded for a human, never used to fail a render on
+        its own.
+        """
+        result: dict[str, Any] = {
+            "measurements": {},
+            "issues": [],
+            "critical_issues": [],
+            "visibility": None,
+        }
+        try:
+            from tools.subtitle.srt_audit import audit_srt, file_sha256
+
+            narration_duration = None
+            if edit_decisions:
+                narration = (edit_decisions.get("audio") or {}).get("narration") or {}
+                if narration.get("src"):
+                    narration_duration = self._probe_media_duration(
+                        Path(str(narration["src"]))
+                    )
+
+            expected_captions = None
+            if edit_decisions:
+                expected_captions = (edit_decisions.get("metadata") or {}).get("captions")
+
+            report = audit_srt(
+                sub_source,
+                video_duration=video_duration,
+                narration_duration=narration_duration,
+                expected_captions=expected_captions,
+            )
+            result["issues"].extend(report.get("issues", []))
+            result["critical_issues"].extend(report.get("critical_issues", []))
+
+            # A subtitle file older than the render it claims to describe is
+            # weak evidence: it may belong to a previous cut.
+            sub_path = Path(str(sub_source))
+            stale = False
+            try:
+                if sub_path.is_file() and output_path.is_file():
+                    stale = sub_path.stat().st_mtime > output_path.stat().st_mtime
+            except OSError:
+                stale = False
+
+            result["measurements"] = {
+                "source": str(sub_source),
+                "source_exists": report.get("exists"),
+                "source_sha256": file_sha256(sub_path) if sub_path.is_file() else None,
+                "cue_count": report.get("cue_count"),
+                "coverage_ratio": report.get("coverage_ratio"),
+                "coverage_seconds": report.get("coverage_seconds"),
+                "first_cue_start": report.get("first_cue_start"),
+                "last_cue_end": report.get("last_cue_end"),
+                "trailing_gap_seconds": report.get("trailing_gap_seconds"),
+                "timing_drift_detected": report.get("timing_drift_detected", False),
+                "caption_grid": report.get("caption_grid"),
+                "format_problems": report.get("format_problems", []),
+                "newer_than_render": stale,
+                "narration_seconds": (
+                    round(narration_duration, 3)
+                    if narration_duration is not None
+                    else None
+                ),
+            }
+            if stale:
+                result["issues"].append(
+                    "The declared subtitle file was modified after the render "
+                    "was produced — it may not describe the delivered video."
+                )
+
+            if probe_visibility:
+                from tools.subtitle.srt_audit import probe_bottom_band_ink
+
+                result["visibility"] = probe_bottom_band_ink(
+                    output_path, video_duration
+                )
+        except Exception as e:  # never let the audit break a render
+            result["issues"].append(f"Subtitle audit error: {e}")
+        return result
+
+    def _burn_subtitles_with_record(
+        self,
+        video_path: Path,
+        subtitle_path: str,
+        style: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """Burn subtitles and return a machine-readable burn record.
+
+        OpenMontage-local addition (not in upstream).
+
+        `_burn_subtitles` reports only the output path, which left the final
+        review unable to tell "these pixels contain the captions" from "an
+        .srt exists somewhere". The record returned here (source path, its
+        sha256, the burn time) is what `_run_final_review` consumes via its
+        `subtitles_burned` argument.
+        """
+        from tools.subtitle.srt_audit import file_sha256
+
+        sub_path = Path(str(subtitle_path))
+        if not sub_path.is_file():
+            return ToolResult(
+                success=False,
+                error=f"Subtitle file for burn-in not found: {sub_path}",
+            )
+
+        # Burn to a sibling temp file and swap it in. ffmpeg cannot read and
+        # write the same path, and an interrupted burn must not destroy the
+        # already-rendered master.
+        temp_output = video_path.with_name(
+            f".{video_path.stem}.burn-{time.time_ns()}{video_path.suffix}"
+        )
+        result = self._burn_subtitles(
+            {
+                "input_path": str(video_path),
+                "subtitle_path": str(sub_path),
+                "output_path": str(temp_output),
+                "subtitle_style": style or {},
+            }
+        )
+        if not result.success:
+            if temp_output.exists():
+                temp_output.unlink(missing_ok=True)
+            return result
+        if not temp_output.is_file():
+            return ToolResult(
+                success=False,
+                error=f"Subtitle burn reported success but produced no file: {temp_output}",
+            )
+        temp_output.replace(video_path)
+
+        record = {
+            "source": str(sub_path),
+            "source_sha256": file_sha256(sub_path),
+            "source_bytes": sub_path.stat().st_size,
+            "output": str(video_path),
+            "output_bytes": video_path.stat().st_size if video_path.is_file() else None,
+            "style": style or {},
+        }
+        result.data = dict(result.data or {}, **{"burn_record": record})
+        result.artifacts = [str(video_path)]
+        return result
 
     @staticmethod
     def _probe_media_duration(path: Path) -> float | None:
@@ -2658,7 +3015,7 @@ class VideoCompose(BaseTool):
         rendered_duration: float,
         edit_decisions: dict[str, Any] | None,
         technical_probe: dict[str, Any],
-    ) -> None:
+    ) -> str | None:
         """Flag a render that cuts off the tail of its own narration.
 
         A composition whose length is a hardcoded constant (the atelier
@@ -2669,20 +3026,26 @@ class VideoCompose(BaseTool):
         Reads the narration path from `edit_decisions.audio.narration.src`
         (the canonical place the edit stage records it) and compares real
         durations. Adds findings to `technical_probe` in place.
+
+        Returns the finding as a *critical* issue string when the render is
+        truncated, else None. The caller must escalate the return value into
+        `critical_issues` — writing it into `issues` alone was the original
+        defect: LDWS's truncation was reported and still passed, because the
+        status decision only substring-matched a hardcoded keyword list.
         """
         if not edit_decisions:
-            return
+            return None
         narration = (edit_decisions.get("audio") or {}).get("narration") or {}
         src = narration.get("src")
         if not src:
-            return
+            return None
         path = Path(str(src))
         if not path.is_file():
             technical_probe["narration_duration_check"] = {
                 "status": "skipped",
                 "reason": f"narration source not found: {path}",
             }
-            return
+            return None
 
         narration_duration = self._probe_media_duration(path)
         if narration_duration is None:
@@ -2690,7 +3053,7 @@ class VideoCompose(BaseTool):
                 "status": "skipped",
                 "reason": "could not probe narration duration (ffprobe failed)",
             }
-            return
+            return None
 
         # A render shorter than its narration is always a defect: the last words
         # are gone. A render longer than the narration is fine (tail music, an
@@ -2707,14 +3070,18 @@ class VideoCompose(BaseTool):
             "narration_path": str(path),
         }
 
-        if not within:
-            technical_probe["issues"].append(
-                f"Narration truncated: rendered {rendered_duration:.3f}s but the "
-                f"narration is {narration_duration:.3f}s — the last "
-                f"{shortfall:.3f}s of speech is missing. Raise the composition "
-                f"length to at least the audio duration (e.g. derive "
-                f"durationInFrames from the loaded audio rather than a constant)."
-            )
+        if within:
+            return None
+
+        finding = (
+            f"Narration truncated: rendered {rendered_duration:.3f}s but the "
+            f"narration is {narration_duration:.3f}s — the last "
+            f"{shortfall:.3f}s of speech is missing. Raise the composition "
+            f"length to at least the audio duration (e.g. derive "
+            f"durationInFrames from the loaded audio rather than a constant)."
+        )
+        technical_probe["issues"].append(finding)
+        return finding
 
     @staticmethod
     def _parse_probe_fps(fps_str: str) -> float:
@@ -2915,11 +3282,45 @@ class VideoCompose(BaseTool):
                 resolved["back_color"] = bg
 
         # Layer 2: edit_decisions subtitle style
+        # OpenMontage-local patch: upstream called .items() on
+        # `subtitles.style`, which the schema defines as a STRING — every
+        # schema-conformant project crashed the FFmpeg burn path.
+        # `subtitles.style` is a STRING in edit_decisions.schema.json ("sentence",
+        # "word-by-word", "karaoke") — it names the caption mode, not an ASS style
+        # dict. Calling .items() on it raised AttributeError for every project that
+        # followed the schema (ldws-teaching writes "sentence"), which made the
+        # FFmpeg burn path crash rather than render. The ASS-style dict belongs in
+        # `subtitles` itself (font/font_size/color/...), which is flat, so read
+        # those keys directly; only treat `style` as a dict if a caller wrongly
+        # nested one there.
         if edit_decisions:
-            ed_style = edit_decisions.get("subtitles", {}).get("style", {})
-            for k, v in ed_style.items():
-                if v is not None:
-                    resolved[k] = v
+            ed_subs = edit_decisions.get("subtitles", {})
+            ed_style = ed_subs.get("style", {})
+            if isinstance(ed_style, dict):
+                for k, v in ed_style.items():
+                    if v is not None:
+                        resolved[k] = v
+            # Flat ASS-ish keys written alongside `style` per the schema.
+            for k in (
+                "font", "font_size", "bold", "primary_color", "outline_color",
+                "back_color", "border_style", "outline_width", "shadow",
+                "margin_v", "alignment",
+            ):
+                if ed_subs.get(k) is not None:
+                    resolved[k] = ed_subs[k]
+            # `color` is the schema's name for the primary text colour.
+            if ed_subs.get("color") is not None:
+                resolved["primary_color"] = ed_subs["color"]
+            if ed_subs.get("background") is not None:
+                resolved["back_color"] = ed_subs["background"]
+            # `position` names a placement, which maps onto ASS alignment.
+            position = ed_subs.get("position")
+            if position == "top-center":
+                resolved["alignment"] = 8
+            elif position == "center":
+                resolved["alignment"] = 5
+            elif position == "bottom-center":
+                resolved["alignment"] = 2
 
         # Layer 3: Explicit override (highest priority)
         if explicit_style:

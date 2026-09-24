@@ -219,7 +219,22 @@ class RemotionCaptionBurn(BaseTool):
     def _srt_to_word_captions(
         self, srt_path: str, corrections: dict[str, str] | None = None
     ) -> list[dict]:
-        """Parse SRT file into word captions."""
+        """Parse SRT file into word captions.
+
+        OpenMontage-local patch: upstream used `text.split()`, which for
+        Chinese returns the whole cue as one "word" and fabricated per-word
+        timings. See docs/DEV-PLAN-zh-CN.md Phase 3 (B4).
+
+        Chinese has no spaces, so ``text.split()`` returns the whole cue as one
+        "word" — the word-level highlight then degenerates into an even split
+        of the cue duration, which is exactly the character-count interpolation
+        the subtitle work set out to remove. When a cue contains CJK we cannot
+        invent word boundaries we do not have, so the cue is emitted as a single
+        caption spanning its true start and end. That keeps the timing
+        acoustically honest (no fabricated per-word offsets) at the cost of
+        per-word highlighting, which is the right trade for a language this
+        tokenizer cannot segment.
+        """
         content = Path(srt_path).read_text(encoding="utf-8")
         blocks = re.split(r"\n\n+", content.strip())
         corr = {k.lower(): v for k, v in (corrections or {}).items()}
@@ -249,6 +264,18 @@ class RemotionCaptionBurn(BaseTool):
                 + int(m.group(8))
             )
             text = " ".join(lines[2:]).strip()
+
+            from tools.subtitle.srt_audit import has_cjk
+
+            if has_cjk(text):
+                # One caption per cue, using the cue's real bounds.
+                captions.append({
+                    "word": text,
+                    "startMs": start_ms,
+                    "endMs": end_ms,
+                })
+                continue
+
             words = text.split()
             per_word = (end_ms - start_ms) / max(len(words), 1)
             for i, w in enumerate(words):

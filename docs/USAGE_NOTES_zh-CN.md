@@ -570,5 +570,147 @@ examples/ldws-teaching/
   （A3 验证用的是 `--scale=0.25` 低清测试渲染，写在 `/tmp`，未覆盖交付物）。
   如需交付新版成片，需按完整参数重渲 + 重新烧字幕（属 Phase 3 的 B2 范围）。
 - `projects/ldws-teaching` 内留了一个备份 `index.tsx.bak-preA3`（该目录不入库）。
-- **仍待办**：Phase 3（B 组：`subtitle_check` 假通过、atelier 不烧字幕、漂移阈值、连带脱钩）
-  与 Phase 4（C 组：APIYi 注册，**须先修 3 项会花钱的缺陷**）。
+- **仍待办**：Phase 4（C 组：APIYi 注册，**须先修 3 项会花钱的缺陷**）。
+  ~~Phase 3（B 组）~~ 已于同日完成，见第 10 节。
+
+---
+
+## 10. Phase 3（B 组）实施记录（2026-09-24）
+
+目标：让「字幕/时长」这类校验**具备证据效力**，而不是假通过。
+
+### 10.1 改动前的复现（先立证据，再动手）
+
+| 缺陷 | 复现方法 | 改动前实测结果 |
+|---|---|---|
+| B1 | 2 秒视频 + 唯一 cue 在 `00:16:39` 的 SRT | `subtitles_present=true`、`coverage_ratio=1.0`、`issues=[]`、`status=pass` |
+| B2 | `crop` 底部条带 + `geq` 统计近白像素，取 7 个时间点 | master **全 0.000%**；final **0.983~3.069%** |
+| B3 | 5 秒成片 + 20 秒旁白 | 已记录 `status=truncated / shortfall=15.064`，但 `status=pass` |
+| B4 | `_srt_to_word_captions()` 读 40 条 CJK cue | 输出 **44** 个伪"词" |
+
+### 10.2 B1 —— 新建 `tools/subtitle/srt_audit.py`
+
+纯标准库（与 `phrase_aligner.py` 同一姿态）。对外函数：
+`parse_srt()` / `audit_srt()` / `compare_cue_grid()` / `probe_bottom_band_ink()` /
+`union_span()` / `file_sha256()` / `has_cjk()` / `normalise_text()`。
+
+**一个必须记住的算术坑**：覆盖率要用**裁剪到视频窗口内**的并集。
+我第一版没裁剪，结果那条 999s 的 cue 算出 `coverage_ratio=1.0` —— **和原缺陷一样错**。
+裁剪后为 `0.0`。这正是「不可显示的 cue 不能计入覆盖」。
+
+**严重度结构化**：`audit_srt()` 自己区分 `critical_issues`（文件根本不是这条片子的字幕轨、
+cue 越界、乱序、不可解析）与 `issues`（如字幕比画面早结束几秒）。
+不靠对消息文本做子串匹配。
+
+**已删除**「文件存在即 `subtitles_present=true`」。现在要求**烧录证据**。
+
+### 10.3 B2 —— atelier 先烧后审
+
+**根因是顺序**：`final_review` 原先在烧录**之前**跑，所以结构上不可能看见字幕。
+改动：`_render_via_atelier()` 在审查前调用新增的 `_burn_subtitles_with_record()`。
+
+两个实现细节（都是踩过的坑）：
+- **不能读写同一路径**：`_burn_subtitles` 直接写 `output_path`。若 input==output，
+  ffmpeg 会失败或损坏文件。改为**烧到临时文件再原子替换**，顺便保证中断不会毁掉已渲染的 master。
+- **记录必须含 sha256**：只有这样才能回答「烧进去的是不是声明的那个文件」。
+
+尊重新增的 `edit_decisions.subtitles.burn_in`（schema 新字段，默认 `true`）。
+
+实测：burn 前 ink `0.0%` → burn 后 `3.064%`；record 回填正确；无残留临时文件；抽帧目视
+字幕位于底部中央。
+
+### 10.4 B3 —— 根因与计划所写不同
+
+计划写的是「25% 阈值过宽」。实测发现**该分支从未执行**：
+- `total_duration_seconds` **不是**合法 `edit_decisions` 字段（schema `additionalProperties: false`）
+  → 永远是 `None`；
+- `metadata.target_duration_seconds` 合法，但**全仓无任何写入方**。
+
+LDWS 的 `final_review.json` 里 `duration_drift_pct: None` 就是铁证。
+
+**真正的修复**：`_run_final_review` 不再用关键词子串猜 `status`。各检查把致命发现登记进
+`critical_issues`，`status` 由它派生；致命项 → `fail` + `re_render`（用户拍板）。
+`_check_narration_truncation()` 改为**返回**发现，由调用方升级。
+
+实测：同一 5s vs 20s 场景 `pass → fail`。
+
+### 10.5 B4 —— 两处脱钩
+
+- **声明源 ≠ 实际烧录源**：比对 sha256，不一致判 fail。（LDWS 的真实情形：声明
+  `narration.srt`、实烧 `sync4`。）这也是为什么必须先有 B2 的 burn record 才能查这件事。
+- **中文 `split()`**：CJK cue 不再切词，每 cue 一条、保留真实起止时间；英文仍逐词。
+  实测 40 cue → 40 条；`hello brave new world` → 4 词。
+
+### 10.6 计划外发现（都修了）
+
+1. **`_resolve_subtitle_style` 对 schema 合法输入必然崩溃**
+   schema 定 `subtitles.style` 为**字符串**（`"sentence"` / `"word-by-word"` / `"karaoke"`），
+   代码却调 `.items()` → `AttributeError: 'str' object has no attribute 'items'`。
+   LDWS 自己就写了 `"style": "sentence"` → **任何走 FFmpeg 烧录的路径都会崩**。
+   改为按 schema 读平铺字段（`font`/`font_size`/`color`/`background`/`position`/`margin_v`…），
+   同时保留对旧嵌套 dict 的兼容。
+
+2. **A3 当时只做到「报告」，没做到「拦截」**
+   `_check_narration_truncation` 只写 `issues`，从未影响 `status`。
+   已在 Phase 1 记录里加注修正，并在本阶段接入 critical 通道。
+
+3. **一条我自己引入的缺陷**（记下来避免重犯）：`_audit_subtitles` 最初把
+   critical 项登记成一句**概括文本**（`"subtitles enabled but no burn evidence..."`），
+   而 `issues` 里是**另一句详细文本**。结果 `critical_issues` 与 `issues_found` 对不上，
+   读报告的人无法知道到底是什么被拦下。已改为**同一个字符串**贯穿三处。
+   这个 bug 是被新写的契约测试
+   （`test_critical_issues_are_recorded_structurally`）抓出来的。
+
+4. **`burn_in: false` 的语义需要单独处理**（又一条，同样由测试抓出）
+   第一版把"无 burn record"一律判 critical。但若 agent 显式声明
+   `burn_in: false`（字幕由 composition 自己绘制），就**永远不会有 burn record**，
+   于是合规的合成本绘制字幕路径会被误判为 fail。
+   已改为区分两种情形：`burn_in: false` → 像素探针**仅作告警**（按决策，它本来就
+   不能证明字幕缺失）；其余 → 无证据即 critical。这条恰好印证了"探针只作告警"的决策
+   是对的：它是 composition 绘制路径下唯一可得的证据，但不足以定案。
+
+### 10.7 上游文件标记
+
+| 文件 | 标记数 | 说明 |
+|---|---|---|
+| `tools/video/video_compose.py` | 4 | B1/B2/B3/样式解析 |
+| `tools/video/remotion_caption_burn.py` | 1 | B4 CJK |
+| `schemas/artifacts/edit_decisions.schema.json` | 1 | 新增 `subtitles.burn_in` |
+
+新增文件（非上游）：`tools/subtitle/srt_audit.py`、`tests/contracts/test_subtitle_verification_contracts.py`。
+
+### 10.8 新增测试
+
+`tests/contracts/test_subtitle_verification_contracts.py` —— **51 项**，全部离线确定性
+（用 ffmpeg 现造 2 秒真 MP4，SRT 内联写入）：
+
+- SRT 解析：`,1000` 畸形毫秒必须**拒绝**（严格解析器行为）、乱序、`end < start`、
+  非数字序号**不丢 cue**、CRLF、空输入不崩；
+- 覆盖率算术：重叠不重复计、**裁剪到窗口**、部分重叠只算可见部分；
+- 越界/漂移/不同轨检出；
+- **门禁行为**：越界 SRT 必须 fail、旁白截断必须 fail、声明≠实烧必须 fail；
+- 可见性探针**只告警**（不会单独 fail 合规渲染）；
+- `critical_issues` 与 `issues_found` 必须一致；
+- `final_review` 产出仍满足自身 schema；
+- 三种 `subtitles.style` 形状（schema 字符串 / 平铺 dict / 旧嵌套 dict）都不崩；
+- 提交的参考 SRT：对 77.824s 渲染审计干净、对旧 76.054s 渲染**必须报越界**、SHA 稳定；
+- **atelier 烧录顺序**（B2 核心）：stub 掉 Remotion 渲染后断言副作用顺序必须是
+  `render → burn → review`、burn record 必须送达审查器、`burn_in:false` 与
+  `enabled:false` 必须跳过烧录、烧录失败必须让整次渲染失败（绝不交付没上字幕的 master）。
+
+### 10.9 测试基线
+
+```
+Phase 1 后: 1441 passed, 0 failed, 12 skipped      （全量 tests/）
+Phase 3 后: 1492 passed, 0 failed, 12 skipped      （+51，无回归）
+```
+
+### 10.10 本次遗留 / 未做
+
+- **未重渲 LDWS 成片**。交付物仍是旧版（76.054s，手工烧的 `sync4`）。
+  `projects/ldws-teaching/artifacts/final_review.json` **仍是旧的手写产物**，
+  新的审查器要等下次渲染才会重写它。
+- **未做 OCR 真核验**（按决策，像素探针只作告警）。
+- LDWS 历史产物按 Re-log 约定**只追加** `decision_log` 第 `d-007` 条记录实际交付来源，
+  未改动既有 6 条、未改动 `edit_decisions`。
+- **下一步：Phase 4（C 组）**，硬前置是先修 C0.1/C0.2/C0.3 三项会真花钱的缺陷。

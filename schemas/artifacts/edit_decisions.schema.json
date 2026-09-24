@@ -165,7 +165,12 @@
         "outline_color": { "type": "string" },
         "background": { "type": "string", "description": "Background color with optional alpha (e.g. #00000088)" },
         "position": { "type": "string", "enum": ["top-center", "bottom-center", "center"] },
-        "max_words_per_line": { "type": "integer", "minimum": 1 }
+        "max_words_per_line": { "type": "integer", "minimum": 1 },
+        "burn_in": {
+          "type": "boolean",
+          "default": true,
+          "description": "OpenMontage-local patch. Whether a renderer that cannot draw captions itself (the atelier path) should burn `source` onto the rendered master before the post-render review. Set false only when the composition draws its own captions; leave unset to burn."
+        }
       },
       "additionalProperties": false
     },
