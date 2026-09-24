@@ -49,8 +49,9 @@ Phase 3 完成（全量 tests/）:                 →  1492 passed, 0 failed, 1
 | **B** | atelier 路径**不烧字幕** | 抽帧：master 无字幕、final 有字幕 → 未记录的二次烧录 | 🔴 高 | ✅ 已修 |
 | **B** | 时长漂移检查**从未执行**（计划外发现） | 读的 `total_duration_seconds` 非法、`metadata.target_duration_seconds` 无写入方 | 🔴 高 | ✅ 已修 |
 | **B** | `subtitles.style` 字符串 → FFmpeg 烧录**必然崩溃**（计划外发现） | schema 定 `style` 为 string，代码对其调 `.items()` | 🔴 高 | ✅ 已修 |
-| **C** | APIYi 技能未注册进 registry | `'apiyi' in name` → `[]` | 🟡 中 | ⬜ Phase 4 |
-| **C** | 2 条**会真花钱**的缺陷（D1/D2） | 首帧 60s 超时白提交；任务孤儿不取消 | 🔴 高 | ⬜ Phase 4 |
+| **C** | APIYi 技能未注册进 registry | `'apiyi' in name` → `[]` | 🟡 中 | ✅ `apiyi_image`（C1a） |
+| **C** | 2 条**会真花钱**的缺陷（D1/D2） | 首帧 60s 超时白提交；任务孤儿不取消 | 🔴 高 | ✅ 已修（C0.1/C0.2） |
+| **C** | Seedance 查询路由健康度不可判定（D10） | 10 个历史 ID 全为 32~110 天前，超过 7 天保留期 | 🟡 中 | ⏸ 未决，阻塞 C1b |
 
 ---
 
@@ -292,22 +293,63 @@ burn record 送达、`burn_in:false` 跳过、烧录失败即整体 fail）。
 
 ---
 
-## 5. Phase 4（C 组）· APIYi 注册进 registry
+## 5. Phase 4（C 组）· APIYi 注册进 registry —— ✅ 本轮范围（C0–C3 图片侧 + C4）已完成
 
 **前置硬条件：先修 3 项会真花钱的缺陷**，否则等于把烧钱路径接进流水线。
+本轮**未花任何钱**（全程离线 + 只读 HTTP 探测）。
 
 | # | 改动 | 状态 |
 |---|---|---|
-| C0.1 | `generate_video.py:242` `timeout=60` 参数化（**D1**） | ☐ |
-| C0.2 | 提交失败不取消任务（**D2**）→ 加 `task_id` 回捞/取消入口 | ☐ |
-| C0.3 | 上传前校验格式/大小/边长（**D9**） | ☐ |
-| C1 | 包装 `ApiyiGptImage2All` / `ApiyiSeedanceVideo` 两个 `BaseTool` 子类（复用脚本逻辑，**不走 subprocess**） | ☐ |
-| C2 | `.env` / `.env.example` 增 `APIYI_*`；`docs/PROVIDERS.md` 登记（注意 `test_env_example.py` 要求注释不得被解析成凭据） | ☐ |
-| C3 | 契约测试 + `estimate_cost`（图片精确 $0.03×n） | ☐ |
-| C4 | 裁定 Node vs Python 版（文档说 Node 优先，但 Node 缺 `-k`、`--duration -1` 崩溃；实测记录说 Python 更稳 —— D8 已从代码证实） | ☐ |
+| C0.1 | `generate_video.py:242` `timeout=60` 参数化（**D1**）→ `--create-timeout`（默认 300s），且创建**绝不重试** | ✅ |
+| C0.2 | 任务 ID **先原子落盘** `.task.json` 再轮询 + `--query`/`--resume` 回捞（**D2**） | ✅ |
+| C0.3 | 上传前校验格式/大小/边长/宽高比，**在 base64 之前**拒绝（**D9**） | ✅ |
+| C0.0 | ~~提交前"路由健康探针"~~ → **已自我否决并取消**：用捏造 ID 探不出路由健康（见下） | ❌ 取消 |
+| C1a | 包装 `ApiyiGptImage2All` → `tools/graphics/apiyi_image.py`（复用脚本逻辑，**不走 subprocess**） | ✅ |
+| C1b | 包装 `ApiyiSeedanceVideo` → **保持阻塞**，理由见 §5.3 | ⏸ 阻塞 |
+| C2 | `.env` / `.env.example` 增 `APIYI_*`；`docs/PROVIDERS.md` 登记 | ✅ |
+| C3 | 契约测试 + `estimate_cost`（图片精确 $0.03×n） | ✅ |
+| C4 | 裁定 Node vs Python 版 → **Python**（Node 缺 `-k`、`--duration -1` 崩溃，已实测复现） | ✅ |
 
 **命名约定**：`capability` 必须用精确串 `image_generation` / `video_generation`，否则 selector 发现不到；`provider` 统一 `apiyi`。
 **无需改动** `pipeline_defs/*.yaml`（selector 自动发现）与 `Makefile`。
+
+### 5.1 与原计划的两处口径修正
+
+1. **C0.2 不能做"取消"**。实测 `DELETE /…/tasks/{id}` 返回 `200 text/html` 2870 字节，与一个
+   确定不存在的路径 `/totally/not/a/route` **逐字节相同**——是前端 SPA 兜底，**不是接口**。
+   故只做"落盘 + 回捞"。
+2. **C0.0 取消**。判定查询路由健康**必须用 7 天内的新鲜 task_id**；用捏造 ID 时"已过期"与
+   "路由故障"返回**完全一致**（皆 401），探针**不可能给出有效信号**，属安全剧场。
+   其真实意图已由 C0.2 完整覆盖。
+
+### 5.2 计划外发现并修复的缺陷（3 个在自己新写的代码里 + 1 个文档失真）
+
+| # | 缺陷 | 后果 |
+|---|---|---|
+| 1 | URL 正则在扩展名处**截断**签名直链 | R2 签名在 query string → 下载 403，**像 CDN 故障实为解析 bug** |
+| 2 | data URI 正则**吞掉尾随散文** | 提取值含空格 → base64 解码失败 |
+| 3 | 本地参考图**硬编码** `data:image/png` | JPEG/WebP 被误标 mime（**vendor 脚本同样有此 bug**） |
+| 4 | 两份 vendor SKILL.md 称"优先 Node、参数一致" | 实测**不成立**（Node 无 `-k`、`--duration -1` 崩）→ 已回写更正 |
+
+三个回归测试均通过**变异验证**（改回缺陷版 → 测试必失败；改回 → 文件逐字节相同）。
+
+### 5.3 为何 C1b（Seedance 视频工具）仍阻塞
+
+调查初期曾判断"Seedance 查询路由故障"，**该结论已撤回**：`api-details.md` 明写 task_id 仅
+**7 天**内可查，而工作区全部 10 个 `cgt-*` ID 均为 **32~110 天**前，磁盘上**无** 7 天内任务。
+"已过期"是更简约的解释。**定论需要一个新鲜 task_id，即一次真实付费提交**——本轮未申请、未花费；
+其边际成本会在下次真正生成视频时自然为零。
+
+因此 **D10 状态＝未决**。若查询路由确有问题，注册该工具等于交付一个必然失败、且每次提交都
+产生已计费孤儿的工具。C0.1–C0.3 的加固已先行落地，为将来解封做好准备。
+
+### 5.4 测试基线
+
+```
+Phase 1 后:  1441 passed, 0 failed, 12 skipped
+Phase 3 后:  1492 passed, 0 failed, 12 skipped   (+51)
+Phase 4 后:  1564 passed, 0 failed, 12 skipped   (+72)
+```
 
 ---
 
@@ -316,12 +358,14 @@ burn record 送达、`burn_in:false` 跳过、烧录失败即整体 fail）。
 ```
 Phase 1 (A) ──→ Phase 2 (D1/D3/D4) ──→ Phase 3 (B) ──→ Phase 4 (C)
   字幕根因        记录 + 推送            可信度          注册(需先修 C0)
-  ✅ 完成          ✅ 完成               ✅ 完成         ⬜ 下一步
+  ✅ 完成          ✅ 完成               ✅ 完成         ✅ C0–C3(图片) + C4
+                                                         ⏸ C1b 待 D10 定论
 ```
 
 **AD 起步第一批动作**：D2（本文档 ✅）→ A1/A2 → A3 → D1/D4。**Phase 1~3 均已落地并推送。**
 
-**Phase 4 的硬前置未变**：先修 C0.1/C0.2/C0.3 三项会真花钱的缺陷，再把 APIYi 接进 registry。
+**Phase 4 的硬前置已满足**：C0.1/C0.2/C0.3 三项烧钱缺陷已修完并加测试锁定，图片工具已接进 registry。
+剩余 C1b 待 D10（查询路由健康度）定论，而定论需一次付费提交产生的 7 天内新鲜 task_id。
 
 ---
 
@@ -344,5 +388,15 @@ Phase 1 (A) ──→ Phase 2 (D1/D3/D4) ──→ Phase 3 (B) ──→ Phase 4
 | **B2 烧录实测** | `_burn_subtitles_with_record`：burn 前 ink 0.0% → burn 后 3.064%，record 正确、无残留临时文件 |
 | **中文切分实测** | 40 cue → 修复前 44 个伪词 / 修复后 40 条真实区间；英文仍逐词（`hello brave new world` → 4 词） |
 | **门禁实测** | 越界 SRT：`pass` → `fail`；旁白截断：`pass` → `fail`；声明≠实烧：`fail`（sha256 比对） |
+| **创建超时可配** | `--create-timeout` 默认 300s（原写死 60s）；轮询请求 30s，两者分离有测试锁定 |
+| **创建绝不重试** | 变异验证：删掉"不重试"约束 → 测试失败（重试=重复扣费） |
+| **任务 ID 先落盘** | 变异验证：删掉落盘 → `test_record_written_before_polling_starts` 失败 |
+| **无 cancel 接口** | `DELETE /tasks/{id}` → `200 text/html` 2870B，与不存在路径**逐字节相同**（SPA 兜底） |
+| **上传前校验** | 变异验证：去掉校验 → 2 个测试失败；不合格文件在 base64 **之前**被拒 |
+| **签名 URL 截断 bug** | 变异验证：改回截断正则 → 测试失败（R2 签名在 query string，截断=403） |
+| **data URI 吞空格 bug** | 变异验证：改回 `\s` 版本 → 测试失败（base64 解码失败） |
+| **参考图 mime 误标** | 变异验证：改回硬编码 `image/png` → 测试失败（vendor 脚本同此 bug） |
+| **Node 版缺陷（C4）** | `--duration -1` → `ERR_PARSE_ARGS_INVALID_OPTION_VALUE`；`-k` → "未知参数 -k"；Python 版均正常 |
+| **D10 不可判定** | 工作区 10 个 `cgt-*` 全为 32~110 天前 > 7 天保留期；捏造 ID 与过期 ID 返回**完全一致**（皆 401） |
 
-详细过程与命令见 `docs/USAGE_NOTES_zh-CN.md` 第 8、9 节。
+详细过程与命令见 `docs/USAGE_NOTES_zh-CN.md` 第 8、9、10、11 节。

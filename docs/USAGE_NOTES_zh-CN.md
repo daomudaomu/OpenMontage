@@ -714,3 +714,218 @@ Phase 3 后: 1492 passed, 0 failed, 12 skipped      （+51，无回归）
 - LDWS 历史产物按 Re-log 约定**只追加** `decision_log` 第 `d-007` 条记录实际交付来源，
   未改动既有 6 条、未改动 `edit_decisions`。
 - **下一步：Phase 4（C 组）**，硬前置是先修 C0.1/C0.2/C0.3 三项会真花钱的缺陷。
+
+---
+
+## 11. Phase 4（C 组）实施记录（2026-09-24）
+
+> 计划见 `docs/DEV-PLAN-zh-CN.md` §5。本轮范围经用户确认＝**C0.0–C0.3 + C1a**，
+> 并**未花任何钱**（全程离线 + 只读 HTTP 探测）。
+> 与原计划的两处口径修正见 §11.6。
+
+### 11.1 C0.1 —— 创建任务超时不再写死 60s
+
+**根因**：`generate_video.py:242` 的 `http_json(req, timeout=60)` 管的是**创建任务**的读超时。
+创建请求要上传 base64 素材（2MB 首帧 → 约 2.7MB 文本）并可能排队，超过 60s 时客户端断连，
+但**任务已在服务端创建并已预扣费**——用户看到"失败"，钱已花。
+
+**改法**：
+- 新增 `--create-timeout`（默认 `DEFAULT_CREATE_TIMEOUT = 300`）；轮询请求仍用短超时
+  `DEFAULT_POLL_REQUEST_TIMEOUT = 30`（实测两者必须分离，已有测试锁定）。
+- **创建请求绝不重试**：响应丢失时无法判断任务是否已创建，重试可能扣两次费。失败时明确
+  提示"创建请求可能已生效"并给 `--query` 回捞指引。
+
+### 11.2 C0.2 —— 任务 ID 先落盘，新增回捞入口
+
+**根因**：拿到的 `task_id` 只 `eprint` 到 stderr，随后任何轮询/下载失败都直接 `return 1`，
+ID 随之丢失 → 已付费任务变孤儿。
+
+**改法**：
+- 拿到 `task_id` 后**立即**原子落盘 `{mp4}.task.json`（`_atomic_write_json`：先写 `.tmp-<pid>`
+  再 `os.replace`），含 `task_id` / `base_url` / `request_body` / `output_path` / `created_at` / `status`。
+- 新增 `--query <task_id>` 与 `--resume <task.json>`，两者**只查询/下载、不创建**，因此不可能重复计费。
+- `--prompt` 改为可选（回捞路径没有提示词）；无 `--query/--resume` 时仍强制要求。
+- 抽出 `finish_task()` 供三条路径（首次轮询 / query / resume）共用，保证恢复路径与正常路径行为一致。
+- 成功下载后把 `.task.json` 的 `status` 更新为 `succeeded` 并记 `completed_at`。
+
+**⚠️ 计划口径修正**：原计划写的"加 `task_id` 回捞/**取消**入口"——**取消在该 provider 无法实现**。
+实测 `DELETE /…/tasks/{id}` 返回 `200 text/html`、2870 字节，与一个确定不存在的路径
+`/totally/not/a/route` 的响应**逐字节相同**（前端 SPA 兜底页）；`PUT`/`PATCH` 同理；
+`api-details.md` 也从未提及 cancel。故本轮**只做"落盘 + 回捞"，不做"取消"**。
+
+### 11.3 C0.3 —— 上传前校验（编码之前）
+
+**根因**：`media_to_url()` 只判"文件存在"；`IMG_MIME` 未命中时**静默回落 `image/png`**；
+格式/大小/边长**零校验**，且 base64 在**任何校验之前**就已构造——一个注定被拒的文件
+先被完整读进内存编码，再被 API 拒绝。
+
+**改法**：新增 `validate_image_file()`，**在编码前**校验
+扩展名白名单（jpeg/png/webp/bmp/tiff/gif/heic/heif）、单张 `< 30MB`、边长 `(300,6000)px`、
+宽高比 `(0.4,2.5)`；不合格直接 `ValueError`，不消耗内存也不发起调用。
+
+**一处知情取舍**：边长校验需读图，用 Pillow。为保住脚本"纯标准库"的承诺，**惰性导入 PIL**，
+缺失时降级为只校验格式/大小**并在 stderr 明示"未能读取尺寸"**——不假装校验过。Pillow 12.3.0
+已装且 `requirements.txt:6` 已声明。
+
+### 11.4 C1a —— `apiyi_image` 注册进 registry
+
+新文件 `tools/graphics/apiyi_image.py`（**不在上游树内**，无需补丁标记）：
+
+| 项 | 值 |
+|---|---|
+| `name` / `capability` / `provider` | `apiyi_image` / `image_generation` / `apiyi` |
+| `dependencies` | `["env:APIYI_API_KEY"]` |
+| `agent_skills` | `["apiyi-gpt-image-2-all-gen"]` |
+| `estimate_cost` | **精确** `0.03 × n`（按次计费，非 token 估算） |
+| 端点 | `POST /v1/chat/completions`（**非** `/v1/images/*`） |
+
+- **不走 subprocess**：脚本逻辑内联为 `/tools/graphics/apiyi_image.py`，失败以 `ToolResult`
+  返回而非丢失退出码。
+- **被 selector 自动发现**（实测 `image_selector.fallback_tools` 含 `apiyi_image`），
+  `pipeline_defs/*.yaml` 与 `Makefile` **无需改动**。
+- 诚实声明能力：`supports["aspect_ratio"] = False`、`supports["seed"] = False`——
+  该模型**无 `size` 参数、无 seed**，比例只能靠提示词引导，不假装支持。
+- 部分失败**如实上报**：已写入的图片是真实且已付费的，`success=False` 但
+  `data.partial_outputs` 保留、`cost_usd` 只按已产出张数计。
+
+### 11.5 计划外发现并修复的 3 个缺陷（都在我自己新写的代码里）
+
+| # | 缺陷 | 后果 | 处理 |
+|---|---|---|---|
+| 1 | URL 正则 `[^\s)\"'<>]+?\.(?:png\|jpg…)` 在扩展名处**截断**签名直链 | R2 签名在 query string 里 → 下载 403，**看起来像 CDN 故障，实为解析 bug** | 正则改为保留 `(?:\?…)?`，并加回归测试 |
+| 2 | data URI 正则用 `[A-Za-z0-9+/=\s]+` **吞掉尾随散文** | 提取值含空格 → base64 解码失败 | 改为不含 `\s`（base64 本就无空格），加回归测试 |
+| 3 | 本地参考图**硬编码** `data:image/png` | JPEG/WebP 被误标 mime，API 可能拒绝或错误解码（**vendor 脚本同样有此 bug**） | 新增 `extension_to_mime()`，加回归测试 |
+
+三个回归测试都做了**变异验证**：把代码改回缺陷版本，测试**必定失败**；改回后文件与变异前
+**逐字节相同**。
+
+### 11.6 计划外发现并修正的文档失真（C4 相关）
+
+两份 vendor SKILL.md 都写"**优先 Node.js 版本**，参数与 Python **一致/保持一致**"。实测**不成立**：
+
+| 断言 | 实测结果 |
+|---|---|
+| Seedance 参数与 Python 一致 | `node generate_video.js --duration -1` → `ERR_PARSE_ARGS_INVALID_OPTION_VALUE`（"argument is ambiguous"）。**官方主推的"智能时长"在 Node 版完全无法使用**（自测 `parseArgs` 亦复现），Python 版正常 |
+| 图片参数一致 | Node 图片脚本 `knownFlags` 里**没有 `-k`/`--api-key`**，实测报"未知参数 -k"；Python 版两者都有 |
+
+**C4 裁定 ＝ Python**，已回写两份 SKILL.md 与 `api-details.md`（均为**非上游跟踪**文件）。
+同一份 `api-details.md` 另补了计费时点、恢复纪律、以及"`GET` 401 不等于路由故障"的辨伪说明。
+
+### 11.7 C2 —— 环境变量与文档登记
+
+- `.env.example`（**上游跟踪** → 加 `# OpenMontage-local patch:` 标记）新增
+  `APIYI_API_KEY=` / `APIYI_API_SEEDANCE_KEY=` 与注释掉的 `APIYI_BASE_URL=`。
+- **实测过的坑**：`tests/contracts/test_env_example.py` 会把"值以 `#` 开头"判为假凭据。
+  实测 `APIYI_API_KEY=   # 注释` → `dotenv_values` 得到 `'# note here'` → **测试失败**；
+  注释**独立成行**安全、`KEY=` 空值安全。故本次注释一律独立成行（已过测试）。
+- `.env`（**未跟踪**、已 gitignore）同步加入同样的空占位。**未写入任何真实密钥**——
+  密钥仍在 `~/.bashrc`。实测 `_load_dotenv()` 只补不覆盖：shell 已 export 的值**不会被 .env 空值遮蔽**
+  （两种情形都已实测，见 §11.9）。
+- `docs/PROVIDERS.md`（**上游跟踪** → 补丁标记）新增 APIYi 章节、环境变量摘要行、
+  快速上手表 `5b` 行、以及文末 provider 总表一行。
+
+### 11.8 C0.0 —— **计划中的"路由健康探针"已取消（自我否决）**
+
+原计划提出新增 C0.0"提交前探测查询路由是否健康，不健康就拒绝提交"。**经推敲后取消**，理由：
+判定查询路由健康**必须用 7 天内的新鲜 task_id**，而用凭空编造的 ID 探测时，"已过期"
+与"路由故障"的返回**完全一致**（都是 401）。因此该探针**不可能给出有效信号**，做出来
+只是**安全剧场**。它的真实意图（"绝不丢失已付费任务"）已由 C0.2 的落盘 + 回捞完整覆盖。
+
+### 11.9 实测证据汇总
+
+**C0.1 / C0.2 / C0.3（离线，零花费）**
+
+| 验证 | 结果 |
+|---|---|
+| `--create-timeout` 默认值 | 300s；轮询请求 30s（分离，有测试锁定） |
+| 创建失败只调用 1 次 | ✅ 绝不重试（mutating 掉"不重试"→ 测试失败） |
+| 落盘时机 | 首次轮询**之前** `.task.json` 已存在（变异验证：删掉落盘 → 测试失败） |
+| 落盘原子性 | 目录无 `.tmp-*` 残留 |
+| `--query` 成功路径 | 直接下载、**不创建**、`rc=0` |
+| `--query` 运行中路径 | 正确进入轮询循环（3 次轮询后成功） |
+| `--resume` | 从记录还原 `task_id` 与自定义 `base_url` |
+| 参数守卫 | 无 prompt（非回捞）→ rc=1；`--query`+`--resume` 同用 → rc=1；记录缺失 → rc=1 |
+| 校验（Pillow 在） | 200px 太小✓、7000px 太大✓、10:1 比例✓、`.txt` 格式✓、0 字节✓、超限✓、1024×1024 通过✓ |
+| 校验时机 | 不合格文件在 base64 **之前**抛错（变异验证：去掉校验 → 2 个测试失败） |
+| 无 Pillow 降级 | 只校格式/大小并明示"未能读取尺寸"，**不崩、不假装** |
+| 零依赖承诺 | 核心路径仍仅标准库（`import` 清单已核） |
+
+**C1a（离线，零花费）**
+
+| 验证 | 结果 |
+|---|---|
+| registry 注册 | `apiyi_image` 已注册，`capability=image_generation`、`provider=apiyi` |
+| selector 发现 | `image_selector.fallback_tools` 含 `apiyi_image` |
+| 计费精确性 | `n=1`→0.03、`n=3`→0.09、`n=0`→0.03、`n=999`→0.30、`n="abc"`→0.03 |
+| 端点正确 | 请求打到 `/v1/chat/completions`，**非** `/v1/images/*` |
+| 签名 URL | 保留 query string（变异验证：改回截断版 → 测试失败） |
+| data URI | 不吞散文、可成功解码（变异验证：改回吞空格版 → 测试失败） |
+| 本地参考图 mime | `.jpg` → `data:image/jpeg`（变异验证：改回硬编码 png → 测试失败） |
+| 真实形态解析 | markdown / 裸 URL / parts 列表 / 单 part dict 全部命中 |
+| 拒稿不当成图片 | 纯文字回复 → `success=False`、**不产生空文件** |
+| 部分失败 | 2 张中第 2 张失败 → `images_generated=1`、`cost_usd=0.03`（只为已产出付费） |
+| 调用前置守卫 | >5 张参考图 / 参考图不存在 / 缺 key / 非 https base_url → 全部**零调用即拒绝** |
+
+**C4（实测复现）**
+
+```
+node generate_video.js --duration -1 -p x
+  → TypeError [ERR_PARSE_ARGS_INVALID_OPTION_VALUE]: Option '--duration' argument is ambiguous.
+node generate_image.js -p test -k sk-x
+  → 错误: 未知参数 -k，请使用 --help 查看帮助
+python generate_video.py --duration -1 -p x     → 通过参数解析（仅报缺 key）
+python generate_image.py --help                 → 正常列出 -k/--api-key
+```
+
+**只读 HTTP 探测（零花费，为 D10 与"取消"结论取证）**
+
+| 探测 | 结果 |
+|---|---|
+| `GET /tasks/{32 天前的真实 id}` | 401 `AuthenticationError`（api 与 vip 双域名、3/3 次、两把 key 均同） |
+| `POST /tasks` 空体 | 503 "Current group **SeeDance2** has no available channels…" → **鉴权通过、组名正确** |
+| `POST` 有效模型 + 缺 `content` | 400 `MissingParameter` → 鉴权通过 |
+| `POST` 无效模型 | 403 "该令牌无权使用模型：…" → 路由与鉴权都活着 |
+| `POST /v1/chat/completions` 空体 | 503（到达 APIYi 路由）；`gpt-image-2-all` → 429 上游负载饱和（**瞬时**，非路由断裂） |
+| `DELETE /tasks/{id}` | 200 `text/html` 2870B，与不存在的路径**逐字节相同** → **SPA 兜底，无 cancel 接口** |
+| 历史任务真实性 | 8 个 mp4 全部 `succeeded`，`created_at → updated_at` 恰为 1.5~2.5 分钟（2026-08-23） |
+
+### 11.10 测试基线
+
+```
+Phase 1 后:  1441 passed, 0 failed, 12 skipped
+Phase 3 后:  1492 passed, 0 failed, 12 skipped   (+51)
+Phase 4 后:  1564 passed, 0 failed, 12 skipped   (+72：APIYi 图片 40 + Seedance 脚本 32)
+```
+
+新测试文件：
+- `tests/contracts/test_apiyi_image_contracts.py`（40）
+- `tests/contracts/test_apiyi_seedance_script_contracts.py`（32）
+
+> 写脚本测试时踩到一个坑并已修：假 `http_json` 若对**每次**调用都返回"创建成功"形状，
+> 轮询会一直跑到 1200s 默认上限，**整个测试套件挂死**。现在 `run_script()` 会注入
+> `--timeout 10` 兜底，并 stub `time.sleep`，且假响应第二次即返回终态。
+
+### 11.11 D10 —— **未决，非"已确认故障"**（重要更正）
+
+调查初期我看到"创建路由鉴权通过、查询路由却 401"，一度判断为**查询路由故障**。
+**该结论已撤回**：`api-details.md` 明写 task_id **仅 7 天内可查**，而工作区内全部 10 个
+`cgt-*` ID 均为 **32~110 天**前，磁盘上**无任何** 7 天内的任务。在"任务已过期"与"路由故障"
+之间，前者是更简约的解释，且对过期 ID 与捏造 ID 的返回**完全一致**。
+
+**定论 D10 需要一个 7 天内的新鲜 task_id**，即需要一次真实付费提交。**本轮未申请、未花费**；
+其边际成本会在**下次真正生成视频时自然为零**（那次提交天然产出新鲜 ID）。
+
+### 11.12 C1b（Seedance 视频工具）**保持阻塞**
+
+未把 Seedance 包装成 `BaseTool`。原因是 D10 未决：**若查询路由真有问题，注册该工具等于
+交付一个必然失败、且每次提交都产生已计费孤儿的工具**。C0.1–C0.3 的加固（创建超时、
+ID 落盘、回捞入口、上传校验）已先行落地，为将来解封做好准备。
+
+### 11.13 本次遗留 / 未做
+
+- **未花任何钱**：无付费提交、无 API 生成调用（C1a 全程用假 `requests` + 断网护栏）。
+- **未做 C1b**（理由见 §11.12）。
+- **未做 C3 的"完整"部分**：`estimate_cost` 已实现且被测试覆盖；Seedance 侧的契约测试
+  只覆盖脚本（非 registry 工具，因为 C1b 未做）。
+- **D10 未决**（见 §11.11）——需新鲜 task_id，因此需一次付费提交。
+- 未改动 LDWS 任何产物；未重渲成片。

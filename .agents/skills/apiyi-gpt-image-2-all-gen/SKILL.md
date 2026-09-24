@@ -36,28 +36,34 @@ description: AI图片生成技能，使用ChatGPT最新生图 gpt-image-2-all，
 ### 第2步：环境检查与命令执行
 1. **检查环境**：确认 `APIYI_API_KEY` 环境变量是否已设置（通常假定已设置，若运行失败再提示用户）。
 2. **构建并运行命令**：
-   - **优先尝试 Node.js 版本**：如果环境有 Node（`node` 命令可用），优先使用 `scripts/generate_image.js`（零依赖，参数与 Python 保持一致）。
-   - **Node 不可用再用 Python 版本**：使用 `scripts/generate_image.py`。
+   - ⚠️ **本仓库已裁定 Python 为准**（2026-09-24 实测）：原文档"优先 Node、参数与 Python 保持一致"
+     的说法**不成立** —— Node 版**没有 `-k` / `--api-key`**（实测报"未知参数 -k"），也无法脱离
+     `APIYI_API_KEY` 环境变量传 key；Python 版两者都支持。
+   - **推荐使用 Python 版本**：`scripts/generate_image.py`（依赖 `requests`，已在项目 requirements 中）。
+   - Node 版本 `scripts/generate_image.js` 仅在无 Python 可用时使用。
+   - **在 OpenMontage 流水线中**：不要直接调脚本，改用注册工具 `apiyi_image`
+     （`capability="image_generation"`, `provider="apiyi"`），逻辑已内联、失败以 ToolResult 返回，
+     且精确计费 $0.03/张。
 
-   **文生图命令模板（优先 Node.js）：**
-   ```bash
-   node scripts/generate_image.js -p "{prompt}" -f "{filename}" [-r {response_format}]
-   ```
-
-   **图生图命令模板（优先 Node.js）：**
-   ```bash
-   node scripts/generate_image.js -p "{edit_instruction}" -i "{input_path}" -f "{output_filename}" [-r {response_format}]
-   ```
-
-   **多图融合命令模板（优先 Node.js）：**
-   ```bash
-   node scripts/generate_image.js -p "融合图1和图2的风格" -i ref1.png ref2.png -f "merged.png" [-r {response_format}]
-   ```
-
-   **（可选）Python 版本命令模板（Node 不可用时）**：
+   **文生图命令模板（Python，推荐）：**
    ```bash
    python scripts/generate_image.py -p "{prompt}" -f "{filename}" [-r {response_format}]
+   ```
+
+   **图生图命令模板（Python，推荐）：**
+   ```bash
    python scripts/generate_image.py -p "{edit_instruction}" -i "{input_path}" -f "{output_filename}" [-r {response_format}]
+   ```
+
+   **多图融合命令模板（Python，推荐）：**
+   ```bash
+   python scripts/generate_image.py -p "融合图1和图2的风格" -i ref1.png ref2.png -f "merged.png" [-r {response_format}]
+   ```
+
+   **Node.js 版本命令模板（仅当无 Python 可用；注意不支持 `-k`）**：
+   ```bash
+   node scripts/generate_image.js -p "{prompt}" -f "{filename}" [-r {response_format}]
+   node scripts/generate_image.js -p "{edit_instruction}" -i "{input_path}" -f "{output_filename}" [-r {response_format}]
    ```
 
 ## ⏱️ 长时间任务处理策略

@@ -40,8 +40,21 @@ description: AI视频生成技能，使用字节跳动 Seedance 2.0 视频生成
 
 1. **检查环境**：确认 `APIYI_API_SEEDANCE_KEY` 环境变量已设置（通常假定已设置，运行失败再提示用户）。令牌须勾选 `SeeDance2` 分组且计费模式为「按量优先」，否则报「该模型无可用渠道」。
 2. **构建并运行命令**：
-   - **优先 Node.js 版本**：有 `node` 命令时优先用 `scripts/generate_video.js`（零依赖，参数与 Python 一致）。
-   - **Node 不可用再用 Python 版本**：`scripts/generate_video.py`（仅用标准库，无需 pip install）。
+   - **优先使用 Python 版本**：`scripts/generate_video.py`（仅用标准库，无需 pip install）。
+     ⚠️ **本仓库已裁定 Python 为准**（2026-09-24 实测）——原文档"优先 Node、参数与 Python 一致"
+     的说法**不成立**，见下方"Node 版本已知缺陷"。
+   - Node 版本 `scripts/generate_video.js` 仅在无 Python 可用时使用，且**不支持** `--duration -1`。
+
+   **Node 版本已知缺陷（实测复现）：**
+
+   | 缺陷 | 表现 |
+   |---|---|
+   | `--duration -1` 不可用 | `parseArgs` 抛 `ERR_PARSE_ARGS_INVALID_OPTION_VALUE`（"argument is ambiguous"）——官方主推的"智能时长"在 Node 版**完全无法使用**（写成 `--duration=-1` 才可能绕过），Python 版正常 |
+   | 参数并非"与 Python 一致" | 上一条即反例；此处文档已更正 |
+
+   **Python 版本已加固（本仓库补丁）**：`--create-timeout` 可配（创建是计费步骤，原写死 60s
+   会在任务已创建扣费后误报失败）、任务 ID 先落盘 `.task.json` 再轮询、`--query` / `--resume`
+   回捞入口、上传前校验格式/大小/边长。详见仓库 `docs/PROVIDERS.md` 的 APIYi 章节。
 
    **文生视频命令模板：**
    ```bash

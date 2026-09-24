@@ -15,6 +15,7 @@ Everything you need to know about every provider in OpenMontage — setup instru
 | 3 | **$0** | ElevenLabs | Premium TTS + music + SFX (10K chars/month free) |
 | 4 | **$0** | Piper (local install) | Fully offline TTS — no API key, no cost, no network |
 | 5 | **~$0.03/image** | fal.ai | FLUX images + Kling/Veo/MiniMax video + Recraft — broad single-key image + video coverage |
+| 5b | **$0.03/image** | APIYi *(local patch)* | GPT Image 2 All images + Seedance 2.0 video; mainland-reachable, flat per-image price |
 | 6 | **~$0.05/image** | OpenAI | GPT Image 2 images + OpenAI TTS |
 | 7 | **~$0.04/image** | Google Imagen | Imagen 4 images (shares the Google API key) |
 | 8 | **pay-as-you-go** | Kling Official | Official direct Kling video, image, TTS, avatar, and lip-sync API, separate from fal.ai Kling |
@@ -62,6 +63,10 @@ KLING_API_BASE_URL=          # Optional; default https://api-singapore.klingai.c
 
 # VOLCENGINE ARK DIRECT SEEDANCE 2.0 / 2.5 API
 ARK_API_KEY=                 # API key body only; do not include the "Bearer " prefix
+
+# APIYI GATEWAY (OpenMontage-local patch)
+APIYI_API_KEY=               # GPT Image 2 All image gen/edit — flat $0.03/image (tool: apiyi_image)
+APIYI_API_SEEDANCE_KEY=      # Seedance 2.0 video — token needs the SeeDance2 group enabled
 
 # VIDEO
 HEYGEN_API_KEY=              # HeyGen avatar video gateway
@@ -1097,6 +1102,92 @@ Gen-3 Alpha Turbo and Gen-4 Aleph were removed from the Runway API on
 
 ---
 
+### APIYi Gateway — GPT Image 2 All + Seedance 2.0 (OpenMontage-local patch)
+
+> **Cheapest per-image option, and a mainland-reachable Seedance path.** APIYi is a
+> Chinese API gateway (`api.apiyi.com`, servers in Los Angeles) that proxies GPT
+> Image 2 All for a flat **$0.03 per image** and ByteDance Seedance 2.0 video.
+> Reachable from mainland China without a VPN.
+
+**Tools unlocked:** `apiyi_image`
+**Env vars:** `APIYI_API_KEY` (images), `APIYI_API_SEEDANCE_KEY` (video)
+
+#### Setup
+
+1. Register at [api.apiyi.com](https://api.apiyi.com) and create a token
+2. For video, ensure the token has the **`SeeDance2` group** enabled — otherwise
+   the API answers `该模型无可用渠道` (no available channel for the model)
+3. Add to `.env`:
+   ```bash
+   APIYI_API_KEY=sk-...
+   APIYI_API_SEEDANCE_KEY=sk-...
+   ```
+
+#### What `apiyi_image` does (and does not) support
+
+| Capability | Supported | Notes |
+|------------|-----------|-------|
+| Text to image | Yes | Chinese prompts are passed through verbatim |
+| Image edit | Yes | Local file paths or URLs as the reference |
+| Multi-image fusion | Yes | Up to 5 input images |
+| Exact output size | **No** | The model has **no `size` parameter** |
+| Aspect ratio | Prompt only | `aspect_ratio` prepends documented wording; not a hard constraint |
+| Reproducible seed | **No** | No seed parameter exists |
+| Multiple outputs | Yes | `n` repeats the call; each costs another $0.03 |
+
+> **Important:** `apiyi_image` reaches the model through the **chat completions**
+> endpoint (`POST /v1/chat/completions`), not `/v1/images/*`. The image arrives as
+> a URL or `data:` reference embedded in the assistant message text and is parsed
+> out of it. A 200 response that carries no recognisable image is reported as a
+> failure with the raw content, not silently written as an empty file.
+
+#### Image Pricing
+
+| Model | Price per image |
+|-------|-----------------|
+| GPT Image 2 All (`gpt-image-2-all`) | **$0.03 flat** |
+
+Flat per-request billing — cost does not vary with resolution, quality, or prompt
+length, so `apiyi_image.estimate_cost()` is exact rather than an estimate. Compare
+against `openai_image`'s `$0.006`–`$0.211` quality-dependent range.
+
+#### Video (Seedance 2.0) — script only, not yet a registered tool
+
+Seedance 2.0 video is available through the
+`.agents/skills/apiyi-seedance2-video-gen/scripts/generate_video.py` script. It is
+**not** registered as a `BaseTool` yet, so `video_selector` does not route to it.
+
+| Model alias | Full model ID | Max resolution |
+|-------------|---------------|----------------|
+| `standard` | `doubao-seedance-2-0-260128` | 1080p |
+| `fast` | `doubao-seedance-2-0-fast-260128` | 720p |
+| `mini` | `doubao-seedance-2-0-mini-260615` | 720p |
+
+Reference prices (16:9, 5 s, no input video): `mini` 480p ¥1.16, `mini` 720p ¥2.50,
+`fast` 720p ¥4.00, `standard` 1080p ¥12.39.
+
+**Billing happens at task creation, not at download.** An accepted create request
+is pre-charged and is *not* refunded if polling, downloading, or the task itself
+later fails. Parameter errors (HTTP 400) are not charged. Two consequences the
+script now enforces:
+
+- The create request is **never retried** — a lost response cannot be
+  distinguished from an uncreated task, and a retry would pay twice.
+- The `task_id` is written to a `.task.json` sidecar **before** polling starts, so
+  a later failure can be recovered with `--query <task_id>` or `--resume <task.json>`
+  without paying again. (The gateway exposes **no cancel endpoint**; `DELETE` on the
+  task route returns an HTML SPA fallback, not an API response.)
+
+`task_id` is queryable for **7 days**; the video's signed URL expires in **24 hours**,
+so download promptly. `POST` authenticates successfully while `GET` on an expired
+task returns `401` — a 401 from the query route on an old task ID means "not found
+or expired", not necessarily a broken credential.
+
+**Free tier:** None — prepaid balance. Register for the gateway; there is no free
+quota for either model.
+
+---
+
 ## Local Providers (Free, No API Key)
 
 These providers run entirely on your machine. No network, no API key, no cost. Some require a GPU.
@@ -1360,6 +1451,7 @@ These tools require only FFmpeg or Python packages — no GPU, no API key.
 | **Atlas Cloud** | `ATLASCLOUD_API_KEY` | `atlas_image`, `atlas_video` | Pay-as-you-go |
 | **Kling Official** | `KLING_API_KEY` | `kling_official_video`, `kling_official_image`, `kling_tts`, `kling_avatar`, `kling_lip_sync` | Pay-as-you-go |
 | **Volcengine Ark** | `ARK_API_KEY` | `seedance_ark` | Pay-as-you-go |
+| **APIYi** *(local patch)* | `APIYI_API_KEY` | `apiyi_image` | $0.03/image flat |
 | **MiniMax direct** | `MINIMAX_API_KEY` | `minimax_image`, `minimax_video` | Pay-as-you-go |
 | **OpenAI** | `OPENAI_API_KEY` | `openai_tts`, `openai_image` | Paid only |
 | **xAI** | `XAI_API_KEY` | `grok_image`, `grok_video` | Paid only |
