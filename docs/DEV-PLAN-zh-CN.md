@@ -60,6 +60,7 @@ Phase 4 完成（全量 tests/）:                 →  1564 passed, 0 failed, 1
 | **C** | APIYi 技能未注册进 registry | `'apiyi' in name` → `[]` | 🟡 中 | ✅ `apiyi_image`（C1a） |
 | **C** | 2 条**会真花钱**的缺陷（D1/D2） | 首帧 60s 超时白提交；任务孤儿不取消 | 🔴 高 | ✅ 已修（C0.1/C0.2） |
 | **C** | Seedance 查询路由健康度不可判定（D10） | 10 个历史 ID 全为 32~110 天前，超过 7 天保留期 | 🟡 中 | ⏸ 未决，阻塞 C1b |
+| **D** | hyperframes「可用」系**假阳性**（D11） | `doctor` 以 exit 0 报告 `ok:false`（缺 Chrome），`_probe_cli` 只看退出码 | 🟡 中 | ⏸ 未修（§13.7） |
 
 ---
 

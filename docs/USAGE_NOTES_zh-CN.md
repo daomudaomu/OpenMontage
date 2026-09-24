@@ -298,7 +298,7 @@ make preflight     # 查看当前能力清单
 | `.env` | 应有 API Key | 2026-09-24 前**逐字节等于 `.env.example`，全为空**；现已填入 APIYi 两把 key（`.env` 被 gitignore） |
 | — | — | 官方 `image_generation` **0/16**、`video_generation` **0/26** 可用；真实凭据只在 `~/.bashrc` |
 | — | — | ✅ venv 里**已有 pytest**（9.1.1，2026-09-24 装）；`requirements-dev.txt` 的 `httpx2` **不是笔误**（见 §13.2） |
-| — | — | 合成运行时 ffmpeg / remotion / hyperframes **三者均可用** |
+| — | — | 合成运行时 ffmpeg / remotion **稳定可用**；hyperframes **不可信**（见 §13.7 更正） |
 
 ### 8.2 🔴 字幕错位的真正根因（本次最重要发现）
 
@@ -1046,7 +1046,7 @@ pip show openai  →  Requires: anyio, httpx2, jiter, pydantic, sniffio, typing-
 | `remotion-composer/node_modules` | 存在（133 项）→ Remotion 渲染就绪 |
 | `ffmpeg` | 4.4.2 → 就绪 |
 | `node` | v24.19.0（HyperFrames 需 ≥22）→ 就绪 |
-| 三个合成运行时 | `ffmpeg / remotion / hyperframes` **全部可用** |
+| 三个合成运行时 | ffmpeg / remotion **可用**；hyperframes **不可信**（见 §13.7） |
 | pytest | 9.1.1 已装 → `make test` 可用 |
 
 ### 13.4 用 `make` 需要先指认真实环境
@@ -1073,3 +1073,85 @@ Phase 5 后:  1564 passed, 0 failed, 12 skipped   （仅文档 + .env 变更，�
 - **未改动任何业务流程代码**（`tools/`、`lib/`、`skills/`、`pipeline_defs/` 均未动）。
 - 未修改工作区根 `AGENTS.md`（只读且不在 git 内）。
 - 未修复"工作区 `AGENTS.md` 的 `.venv` 失真"本身 —— 只能绕过，无法从仓库侧修。
+
+### 13.7 🔴 更正：hyperframes「可用」是假阳性（D11，未修）
+
+**触发**：准备给用户做实拍测试，最后一次复核 `render_engines`，发现同一台机器、同一分钟内
+`hyperframes` 在 `True`/`False` 之间反复跳变。追查后确认这是**两个独立缺陷**，而不是环境抖动。
+
+#### 缺陷 1（严重）：`doctor` 失败但退出码为 0
+
+`npx hyperframes doctor --json` 在本机**实测 `exit=0`**，而它自己的 JSON 里写着：
+
+```json
+{ "ok": false, "checks": [ ..., { "name": "Chrome", "ok": false,
+  "detail": "Chrome Headless Shell is required for local rendering.",
+  "hint": "Run: npx hyperframes browser ensure" } ] }
+```
+
+即 **CLI 把检查结果放在 JSON 里，却始终以 0 退出**。而
+`tools/video/hyperframes_compose.py` 的 `_probe_cli()`（第 357 行）**只看 `returncode`**：
+
+```python
+if proc.returncode != 0:
+    ... error ...
+else:
+    cls._cli_probe_cache = {"status": "ok"}   # ← 只要 exit 0 就算通过
+```
+
+于是 `_runtime_check()['runtime_available']` 变成 `True`，但这个类的 docstring 承诺的是
+*"`runtime_available: True` means the runtime can genuinely run end-to-end, not just that the
+local tooling exists"* —— **代码与自己声明的契约相反**。后果直接违反 `AGENT_GUIDE.md` 第 123 行
+「Present Both Composition Runtimes (HARD RULE)」的用意：会把一个**必然渲染失败**的运行时端给用户。
+
+本机 `doctor` 的完整失败项（共 4 项）：
+
+| 检查项 | 性质 | 说明 |
+|--------|------|------|
+| **Chrome** | **必需** | Chrome Headless Shell 缺失 → 本地渲染不可能 |
+| whisper-cpp | 可选 | 仅转录用 |
+| TTS (Kokoro) | 可选 | 本地语音兜底 |
+| BGM (MusicGen) | 可选 | 本地配乐兜底 |
+
+只有 **Chrome 是必需项**，这也是"不可用"的真实原因。（`doctor` 的 JSON 里**没有** required/optional
+字段，上表的"性质"是从 `detail` 文案里的 "optional" 字样与语义推断的。）
+
+`_doctor()` 动作（第 494 行）有同样的缺陷：`ok = proc.returncode == 0`（第 518 行），
+所以 `execute()` 会 `success=True`，并把 `ok: false` 的 JSON 塞在 `data` 里一起返回。
+
+#### 缺陷 2（次要）：两个超时都贴着临界值
+
+| 位置 | 超时 | 实测耗时 | 结论 |
+|------|------|----------|------|
+| `_probe_cli` 的 `npx … doctor --json` | **20s** | 冷启动 **19.2s**、热 **6.8s / 3.3s / 3.3s**、偶发 **12.96s** | 冷启动贴着上限 → 必然偶发误判 |
+| `_resolve_npm_package` 的 `npm view hyperframes version` | **5s** | 热 **0.29s / 0.35s / 0.46s** | 多数很快，但实测**出现过** `timeout (5s) -- offline or slow registry` |
+
+所以我最初看到的 `render_engines` = `True`/`False`/`True` 跳变，是**两个原因叠加**：
+冷启动超时（假阴性）+ exit-code 缺陷（假阳性）。**不是** HyperFrames 本身时好时坏。
+
+#### 关于我制造的缓存垃圾（已清理）
+
+追查中我曾执行 `npx hyperframes browser ensure` 并中途中断，留下：
+
+- `~/.cache/hyperframes/.chrome.install.lock/`（**陈旧锁**，owner `ea4c29de-…`，无进程持有）
+- `~/.cache/hyperframes/chrome/chrome-headless-shell/152.0.7977.30-…-linux64.zip`（6,067,862 B，
+  **`zipfile` 报 `BadZipFile`——下载被截断，是坏包**）
+
+**已删除**这两个残留（`rm -rf ~/.cache/hyperframes/{.chrome.install.lock,chrome}`），
+`~/.cache/hyperframes/` 现为空目录。经查**无进程**在跑（`ps` 仅有 Edge/ZCode 自带 crashpad）。
+**注意**：想真正装上 Chrome，需要重跑 `npx hyperframes browser ensure` 并**等它跑完**
+（下载 152.0.7977.30，不要中断）。
+
+#### 对本次实拍测试的影响
+
+- **ffmpeg 与 remotion 不受影响，稳定可用** —— 本次测试所需的两个运行时都健康。
+- `hyperframes` 目前**不可承诺可用**。按 HARD RULE 我仍必须在提案阶段如实呈现它，
+  但必须**同时说明它当前会失败**（缺 Chrome Headless Shell），让用户知情选择。
+- **修法（未实施，需批准）预期很小**：`_probe_cli` 解析 `doctor --json` 的 `ok`/必需检查项
+  而不只看退出码；两个超时放宽。因 `hyperframes_compose.py` 是 **upstream 追踪文件**，
+  按既有混合策略需加 `# OpenMontage-local patch:` 标记。
+
+#### 未修原因
+
+按本会话既定规则：**未经明确批准不改代码**。此项为新增发现（编号 D11），
+与 D10 无关，已记入 `docs/DEV-PLAN-zh-CN.md`。
